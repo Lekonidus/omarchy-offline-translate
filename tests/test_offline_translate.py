@@ -349,6 +349,27 @@ class OnCopy(Isolated):
         self.assertTrue(json.loads(self.helper("status").stdout)["config"]["clipboardPopups"])
 
 
+class FirstRunHint(Isolated):
+    def test_hint_shows_once_on_a_fresh_install_and_never_after_setup(self):
+        root = Path(self.tmp.name)
+        fake = root / "fakebin"
+        fake.mkdir()
+        (fake / "notify-send").write_text('#!/bin/bash\necho "$*" >> "$FAKE_LOG"\n')
+        (fake / "notify-send").chmod(0o755)
+        log = root / "hints.log"
+        env = {"PATH": f"{fake}:{os.environ['PATH']}", "FAKE_LOG": str(log),
+               "XDG_DATA_HOME": str(root / "data"), "XDG_STATE_HOME": str(root / "state")}
+        self.helper("first-run-hint", env=env)
+        self.helper("first-run-hint", env=env)
+        self.assertEqual(len(log.read_text().splitlines()), 1, "shown exactly once")
+        self.assertIn("Set up now", log.read_text())
+        if HAVE_MODEL:  # real data dir: already set up, so never shown
+            log.unlink()
+            self.helper("first-run-hint", env={**env, "XDG_DATA_HOME": str(ot.DATA_DIR.parent),
+                                               "XDG_STATE_HOME": str(root / "state2")})
+            self.assertFalse(log.exists())
+
+
 @unittest.skipUnless(HAVE_MODEL, "model not installed")
 class RealModel(unittest.TestCase):
     def test_hebrew_to_english(self):

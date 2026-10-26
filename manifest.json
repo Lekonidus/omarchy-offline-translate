@@ -2,11 +2,14 @@
   "schemaVersion": 1,
   "id": "io.github.lekonidus.offline-translate",
   "name": "Offline Translate",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "Lekonidus",
   "license": "MIT",
-  "description": "Translate ~115 languages to English locally with NLLB-200. Pops up when you copy non-English text; the model loads only while in use.",
-  "kinds": ["overlay", "bar-widget"],
+  "description": "Translate ~115 languages to English, fully offline (NLLB-200). Install with `omarchy plugin add`, then click the bar icon once to run the one-time setup (1.4 GB download). Copying non-English text shows a translation popup; the model loads only while in use.",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "overlay": "Translate.qml",

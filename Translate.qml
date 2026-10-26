@@ -215,7 +215,11 @@ Item {
     onTriggered: if (!watchProc.running) watchProc.running = true
   }
 
-  Component.onCompleted: reapProc.running = true
+  Component.onCompleted: {
+    reapProc.running = true
+    // Once after install: a notification pointing at the one-time setup.
+    Quickshell.execDetached([root.helper, "first-run-hint"])
+  }
 
   // ---- UI ----
 

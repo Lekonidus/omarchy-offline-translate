@@ -14,6 +14,7 @@ BarWidget {
   readonly property string helper: decodeURIComponent(Qt.resolvedUrl("bin/offline-translate").toString().replace(/^file:\/\//, ""))
   property var server: null
   property bool popups: true
+  property bool installed: true
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -43,9 +44,21 @@ BarWidget {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { root.popups = JSON.parse(text).config.clipboardPopups !== false } catch (e) {}
+        try {
+          var status = JSON.parse(text)
+          root.popups = status.config.clipboardPopups !== false
+          root.installed = status.installed === true
+        } catch (e) {}
       }
     }
+  }
+
+  // Notice when the one-time setup finishes in its terminal.
+  Timer {
+    interval: 10000
+    repeat: true
+    running: !root.installed
+    onTriggered: statusProc.running = true
   }
 
   Process {
@@ -64,8 +77,9 @@ BarWidget {
     text: "󰗊"
     active: root.server !== null
     activeColor: Commons.Color.accent
-    opacity: root.popups ? 1 : 0.55
+    opacity: root.popups && root.installed ? 1 : 0.55
     tooltipText: {
+      if (!root.installed) return "Offline Translate\nSetup needed — click to run the one-time setup (1.4 GB download)"
       var model = !root.server ? "Model not loaded"
         : root.server.loaded === true ? "Model loaded (" + root.server.model + ") — middle-click to unload"
         : "Loading model…"

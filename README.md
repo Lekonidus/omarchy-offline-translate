@@ -21,15 +21,24 @@ Quickshell plugin for **Omarchy 4**.
 
 ## Install
 
-```bash
-omarchy plugin add https://github.com/Lekonidus/omarchy-offline-translate.git --enable
-```
+Two steps:
 
-Then click the bar icon (󰗊) and choose **Run setup in a terminal**, or run:
+1. Install and enable the plugin:
 
-```bash
-~/.config/omarchy/plugins/io.github.lekonidus.offline-translate/bin/offline-translate setup
-```
+   ```bash
+   omarchy plugin add https://github.com/Lekonidus/omarchy-offline-translate.git --enable
+   ```
+
+2. Run the one-time setup. A notification offers **Set up now**, or click
+   the translate icon (󰗊) in the bar and choose **Run setup in a terminal**.
+   From a terminal:
+
+   ```bash
+   ~/.config/omarchy/plugins/io.github.lekonidus.offline-translate/bin/offline-translate setup
+   ```
+
+Until setup has run, the bar icon is dimmed and its tooltip says
+**Setup needed**.
 
 Setup creates a Python venv in `~/.local/share/omarchy-offline-translate/`
 (pinned `ctranslate2`, `tokenizers`, `fasttext-predict`, `numpy`, `jeepney`) and
