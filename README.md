@@ -24,7 +24,7 @@ omarchy plugin add https://github.com/Lekonidus/omarchy-offline-translate.git --
 Then click the bar icon (󰗊) and choose **Run setup in a terminal**, or run:
 
 ```bash
-~/.config/omarchy/plugins/*offline-translate*/bin/offline-translate setup
+~/.config/omarchy/plugins/io.github.lekonidus.offline-translate/bin/offline-translate setup
 ```
 
 Setup creates a Python venv in `~/.local/share/omarchy-offline-translate/`
