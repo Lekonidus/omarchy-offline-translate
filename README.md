@@ -6,7 +6,7 @@ model. Nothing is sent to a server.
 
 Quickshell plugin for **Omarchy 4**.
 
-![Translator overlay translating Hebrew to English](docs/overlay.png)
+![Translator overlay translating French to English](docs/overlay.png)
 
 ![Popup after copying Russian text](docs/popup.png)
 
