@@ -172,32 +172,73 @@ class Server(Isolated):
         self.assertTrue(json.loads(resp)["ok"])
 
 
-FAKE_NOTIFY = """#!/bin/bash
-printf '%s\\n' "$(printf '%s\\x1f' "$@")" >> "$FAKE_LOG"
-[[ " $* " == *" -p "* ]] && echo 42
-[[ " $* " == *" -A "* ]] && echo "${FAKE_ACTION:-}"
-exit 0
-"""
+class FakeNotifications(threading.Thread):
+    """org.freedesktop.Notifications on a private bus: records Notify calls and
+    answers bubbles that carry actions with `self.action` (None: never)."""
+
+    def __init__(self, address):
+        super().__init__(daemon=True)
+        from jeepney.bus_messages import message_bus
+        from jeepney.io.blocking import open_dbus_connection
+        self.conn = open_dbus_connection(bus=address)
+        self.conn.send_and_get_reply(message_bus.RequestName("org.freedesktop.Notifications"))
+        self.calls, self.action, self.next_id, self.stop = [], None, 41, False
+
+    def run(self):
+        from jeepney import DBusAddress, HeaderFields, MessageType, new_method_return, new_signal
+        sender = DBusAddress("/org/freedesktop/Notifications", interface="org.freedesktop.Notifications")
+        while not self.stop:
+            try:
+                msg = self.conn.receive(timeout=0.2)
+            except TimeoutError:
+                continue
+            except Exception:
+                return
+            if msg.header.message_type != MessageType.method_call:
+                continue
+            if msg.header.fields.get(HeaderFields.member) != "Notify":
+                self.conn.send(new_method_return(msg))
+                continue
+            _, replaces, _, summary, body, actions, _, _ = msg.body
+            nid = replaces or self.next_id
+            self.next_id += 1
+            self.calls.append({"id": nid, "replaces": replaces, "summary": summary, "body": body, "actions": actions})
+            self.conn.send(new_method_return(msg, "u", (nid,)))
+            if actions and self.action:
+                time.sleep(0.2)
+                self.conn.send(new_signal(sender, "ActionInvoked", "us", (nid, self.action)))
 
 
 @unittest.skipUnless(HAVE_LID, "run offline-translate setup first")
 class OnCopy(Isolated):
-    """on-copy with fake notify-send / wl-paste / wl-copy on PATH."""
+    """on-copy against a private D-Bus with a fake notification server, and
+    fake wl-paste / wl-copy / omarchy-shell on PATH."""
 
     def setUp(self):
         super().setUp()
         root = Path(self.tmp.name)
         fake = root / "fakebin"
         fake.mkdir()
-        (fake / "notify-send").write_text(FAKE_NOTIFY)
         (fake / "wl-paste").write_text('#!/bin/bash\nprintf "%b\\n" "${FAKE_TYPES:-text/plain;charset=utf-8\\nUTF8_STRING}"\n')
         (fake / "wl-copy").write_text('#!/bin/bash\ncat > "$FAKE_COPIED"\n')
+        (fake / "omarchy-shell").write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$FAKE_SUMMONED"\n')
         for f in fake.iterdir():
             f.chmod(0o755)
-        self.log = root / "notify.log"
-        self.copied = root / "copied"
-        self.env.update(PATH=f"{fake}:{os.environ['PATH']}", FAKE_LOG=str(self.log), FAKE_COPIED=str(self.copied),
+        self.copied, self.summoned = root / "copied", root / "summoned"
+        self.bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"],
+                                    stdout=subprocess.PIPE, text=True)
+        address = self.bus.stdout.readline().strip()
+        self.server = FakeNotifications(address)
+        self.server.start()
+        self.env.update(PATH=f"{fake}:{os.environ['PATH']}", FAKE_COPIED=str(self.copied),
+                        FAKE_SUMMONED=str(self.summoned), DBUS_SESSION_BUS_ADDRESS=address,
                         OMARCHY_TRANSLATE_INITIAL_OK="1")
+
+    def tearDown(self):
+        self.server.stop = True
+        self.bus.kill()  # popups still waiting on a click lose the bus and exit
+        self.bus.wait()
+        super().tearDown()
 
     def on_copy(self, text, env=None):
         self.helper("on-copy", stdin=text, env=env)
@@ -206,34 +247,77 @@ class OnCopy(Isolated):
     def notifications(self, count, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            lines = self.log.read_text().splitlines() if self.log.exists() else []
-            if len(lines) >= count:
-                return [line.split("\x1f") for line in lines]
+            if len(self.server.calls) >= count:
+                return self.server.calls
             time.sleep(0.1)
-        self.fail(f"expected {count} notifications, got {self.log.read_text() if self.log.exists() else 'none'}")
+        self.fail(f"expected {count} notifications, got {self.server.calls}")
+
+    def wait_for(self, path, timeout=5):
+        deadline = time.time() + timeout
+        while not path.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        return path.read_text()
 
     def test_popup_shows_translation_and_copy_works(self):
-        self.assertTrue(self.on_copy("שלום, מה שלומך היום?", env={"FAKE_ACTION": "copy"}))
-        placeholder, final = self.notifications(2)
-        self.assertIn("Hebrew → English", placeholder)
-        self.assertIn("-r", final)
-        self.assertIn("42", final, "result replaces the placeholder bubble")
-        self.assertIn("[heb_Hebr] שלום, מה שלומך היום?", final)
-        deadline = time.time() + 5
-        while not self.copied.exists() and time.time() < deadline:
-            time.sleep(0.1)
-        self.assertEqual(self.copied.read_text(), "[heb_Hebr] שלום, מה שלומך היום?")
+        self.server.action = "copy"
+        self.assertTrue(self.on_copy("שלום, מה שלומך היום?"))
+        placeholder, final = self.notifications(2)[:2]
+        self.assertEqual(placeholder["summary"], "Hebrew → English")
+        self.assertEqual(final["replaces"], placeholder["id"], "result replaces the placeholder bubble")
+        self.assertEqual(final["body"], "[heb_Hebr] שלום, מה שלומך היום?")
+        self.assertEqual(final["actions"], ["copy", "Copy English", "open", "Open in Translate"])
+        self.assertEqual(self.wait_for(self.copied), "[heb_Hebr] שלום, מה שלומך היום?")
+
+    def test_open_stashes_text_privately_and_summons_without_it(self):
+        self.server.action = "open"
+        self.on_copy("שלום, מה שלומך היום?")
+        self.assertIn('{"stashed": true}', self.wait_for(self.summoned))
+        self.assertNotIn("שלום", self.summoned.read_text())
+        stash = self.rd / "open.json"
+        self.assertEqual(stash.stat().st_mode & 0o777, 0o600)
+        taken = json.loads(self.helper("take-open").stdout)
+        self.assertEqual(taken, {"text": "שלום, מה שלומך היום?", "src": "he"})
+        self.assertFalse(stash.exists(), "take-open removes the stash")
+        self.assertEqual(json.loads(self.helper("take-open").stdout), {})
+
+    def test_copied_text_never_appears_in_process_arguments(self):
+        import random
+        marker = "".join(random.choice("אבגדהוזחטיכלמנסעפצקרשת") for _ in range(16))
+        self.on_copy(f"הסוד שלי הוא {marker} ואסור לספר לאף אחד")  # no action: popup keeps waiting
+        self.notifications(2)
+        leaks = []
+        for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+            try:
+                if marker in cmdline.read_bytes().decode(errors="replace"):
+                    leaks.append(cmdline.parent.name)
+            except OSError:
+                pass
+        self.assertEqual(leaks, [])
+        self.assertIn(marker, self.server.calls[1]["body"], "the text did reach the notification")
+
+    def test_overlay_copy_goes_over_stdin(self):
+        self.helper("copy", stdin=json.dumps({"text": "line one\nline two"}) + "\n")
+        self.assertEqual(self.wait_for(self.copied), "line one\nline two")
+        self.assertEqual(self.helper("copy", stdin="not json\n").returncode, 1)
 
     def test_markup_in_translation_is_escaped(self):
         self.on_copy("שלום <b>עולם</b> & חברים")
-        self.assertIn("&lt;b&gt;", self.notifications(2)[1][-2])
+        self.assertIn("&lt;b&gt;", self.notifications(2)[1]["body"])
 
     def test_same_text_twice_pops_up_once(self):
         self.assertTrue(self.on_copy("שלום, מה שלומך היום?"))
         self.notifications(2)
         self.on_copy("שלום, מה שלומך היום?")
         time.sleep(1)
-        self.assertEqual(len(self.log.read_text().splitlines()), 2)
+        self.assertEqual(len(self.server.calls), 2)
+
+    def test_click_on_a_replaced_bubble_is_ignored_by_the_old_popup(self):
+        self.on_copy("שלום, מה שלומך היום?")
+        self.notifications(2)
+        self.server.action = "copy"
+        self.on_copy("Привет, как у тебя дела сегодня?")
+        self.notifications(4)
+        self.assertEqual(self.wait_for(self.copied), "[rus_Cyrl] Привет, как у тебя дела сегодня?")
 
     def test_initial_clipboard_when_watcher_starts_is_ignored(self):
         # The helper's parent here is a bash that just started, like a fresh wl-paste --watch.

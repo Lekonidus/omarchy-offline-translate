@@ -11,6 +11,8 @@ Commands:
   run                 read {"text", "src"?} as one JSON line on stdin, print result JSON
   on-copy             wl-paste --watch handler: popup for non-English clipboard text
   detect              read text on stdin, print detection JSON
+  copy                read {"text"} as one JSON line on stdin, put it on the clipboard
+  take-open           print and delete the text a popup's "Open" stashed for the overlay
   status | stop | langs | popups on|off
 """
 
@@ -393,27 +395,81 @@ def request(payload, timeout=600):
 
 # -------------------------------------------------------------------- popup
 
-def notify(args):
-    out = subprocess.run(["notify-send", "-a", "Offline Translate", *args],
-                         capture_output=True, text=True).stdout.split()
-    return out
+class Notifier:
+    """org.freedesktop.Notifications over D-Bus, in-process.
+
+    Copied and translated text must never be a process argument (notify-send,
+    wl-copy, omarchy-shell): /proc/<pid>/cmdline is readable by other users.
+    """
+
+    def __init__(self):
+        from jeepney import DBusAddress, MatchRule
+        from jeepney.bus_messages import message_bus
+        from jeepney.io.blocking import open_dbus_connection
+        self.conn = open_dbus_connection(bus="SESSION")
+        self.addr = DBusAddress("/org/freedesktop/Notifications", bus_name="org.freedesktop.Notifications",
+                                interface="org.freedesktop.Notifications")
+        rule = MatchRule(type="signal", interface="org.freedesktop.Notifications",
+                         path="/org/freedesktop/Notifications")
+        # Subscribe before the first Notify so no ActionInvoked can slip past.
+        self.queue = self.conn.filter(rule).__enter__()
+        self.conn.send_and_get_reply(message_bus.AddMatch(rule), timeout=10)
+
+    def notify(self, summary, body, replaces=0, actions=()):
+        from jeepney import new_method_call
+        flat = [part for action in actions for part in action]
+        msg = new_method_call(self.addr, "Notify", "susssasa{sv}i",
+                              ("Offline Translate", replaces, "", summary, body, flat, {}, -1))
+        return self.conn.send_and_get_reply(msg, timeout=10).body[0]
+
+    def wait_action(self, nid, timeout=3600):
+        """The action key clicked on notification nid, or None if it closed."""
+        from jeepney import HeaderFields
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                sig = self.conn.recv_until_filtered(self.queue, timeout=max(0.1, deadline - time.monotonic()))
+            except TimeoutError:
+                return None
+            if not sig.body or sig.body[0] != nid:
+                continue
+            member = sig.header.fields.get(HeaderFields.member)
+            if member == "ActionInvoked":
+                return sig.body[1]
+            if member == "NotificationClosed":
+                return None
+
+
+def private_file(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+
+
+def wl_copy(text):
+    subprocess.run(["wl-copy"], input=text, text=True)
 
 
 def popup(text, label):
     """Show a notification with the translation; act on Copy / Open."""
+    try:
+        notifier = Notifier()
+    except ImportError:
+        # Installed before popups moved to D-Bus. The message holds no copied text.
+        subprocess.run(["notify-send", "-a", "Offline Translate", "Offline Translate",
+                        "Run setup again to enable copy popups."])
+        return
     rd = run_dir()
     current = rd / "popup.json"
     try:
-        prev_id = json.loads(current.read_text()).get("id", "")
-    except (OSError, ValueError):
-        prev_id = ""
+        prev_id = int(json.loads(current.read_text()).get("id", 0))
+    except (OSError, ValueError, TypeError):
+        prev_id = 0
     token = hashlib.sha256(f"{os.getpid()}{time.time()}".encode()).hexdigest()[:12]
-    name = LANGS[label][1]
-    title = f"{name} → English"
+    title = f"{LANGS[label][1]} → English"
     state = read_state()
     waiting = "Translating…" if state and state.get("loaded") is True else "Loading the translation model…"
-    replace = ["-r", prev_id] if prev_id.isdigit() else []
-    nid = (notify(["-p", *replace, title, waiting]) or [""])[0]
+    nid = notifier.notify(title, waiting, replaces=prev_id)
     current.write_text(json.dumps({"token": token, "id": nid}))
     try:
         resp = request({"op": "translate", "text": text, "src": label})
@@ -428,18 +484,22 @@ def popup(text, label):
 
     if not still_current():
         return  # a newer copy took over this notification
-    replace = ["-r", nid] if nid.isdigit() else []
     if not resp.get("ok"):
-        notify([*replace, "Translation failed", html.escape(resp.get("error", "unknown error"), quote=False)])
+        notifier.notify("Translation failed", html.escape(resp.get("error", "unknown error"), quote=False), nid)
         return
     english = resp["text"]
     body = english if len(english) <= 600 else english[:600].rstrip() + "…"
-    picked = notify([*replace, "-A", "copy=Copy English", "-A", "open=Open in Translate",
-                     title, html.escape(body, quote=False)])
-    if "copy" in picked:
-        subprocess.run(["wl-copy"], input=english, text=True)
-    elif "open" in picked:
-        subprocess.run(["omarchy-shell", "shell", "summon", PLUGIN_ID, json.dumps({"text": text, "src": label})])
+    notifier.notify(title, html.escape(body, quote=False), nid,
+                    actions=[("copy", "Copy English"), ("open", "Open in Translate")])
+    picked = notifier.wait_action(nid)
+    # A newer copy reuses this bubble; its clicks belong to that copy's process.
+    if not still_current():
+        return
+    if picked == "copy":
+        wl_copy(english)
+    elif picked == "open":
+        private_file(rd / "open.json", json.dumps({"text": text, "src": label}))
+        subprocess.run(["omarchy-shell", "shell", "summon", PLUGIN_ID, '{"stashed": true}'])
 
 
 def parent_age():
@@ -569,7 +629,7 @@ def setup(key):
 def main(argv):
     cmd = argv[0] if argv else ""
     # Everything but setup and langs needs the venv's packages.
-    if cmd not in ("setup", "langs", "popups", "status") and VENV_PY.is_file() and Path(sys.prefix) != VENV_PY.parent.parent:
+    if cmd not in ("setup", "langs", "popups", "status", "copy", "take-open") and VENV_PY.is_file() and Path(sys.prefix) != VENV_PY.parent.parent:
         os.execv(str(VENV_PY), [str(VENV_PY), str(Path(__file__).resolve()), *argv])
     if cmd == "setup":
         setup(argv[1] if len(argv) > 1 else "")
@@ -584,6 +644,22 @@ def main(argv):
         print(json.dumps(resp), flush=True)
     elif cmd == "on-copy":
         on_copy()
+    elif cmd == "copy":
+        try:
+            text = json.loads(sys.stdin.readline()).get("text")
+        except (ValueError, AttributeError):
+            text = None
+        if not isinstance(text, str) or not text:
+            return 1
+        wl_copy(text)
+    elif cmd == "take-open":
+        path = run_dir() / "open.json"
+        try:
+            data = path.read_text()
+            path.unlink()
+        except OSError:
+            data = "{}"
+        print(data, flush=True)
     elif cmd == "detect":
         text = sys.stdin.read()
         label, conf = detect(text)

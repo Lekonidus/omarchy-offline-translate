@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.lekonidus.offline-translate",
   "name": "Offline Translate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Lekonidus",
   "license": "MIT",
   "description": "Translate ~115 languages to English locally with NLLB-200. Pops up when you copy non-English text; the model loads only while in use.",

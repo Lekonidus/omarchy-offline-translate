@@ -56,11 +56,19 @@ Item {
     root.opened = true
     statusProc.running = true
     root.setSource(typeof payload.src === "string" && payload.src ? payload.src : "auto")
-    if (typeof payload.text === "string" && payload.text) {
-      input.text = payload.text
-      root.translateNow()
-    }
+    // A popup's "Open" stashes its text in a 0600 file; text never rides in
+    // the summon IPC arguments.
+    if (payload.stashed === true) takeOpenProc.running = true
     Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function loadStashed(raw) {
+    var stash = {}
+    try { stash = JSON.parse(raw) || {} } catch (e) {}
+    if (typeof stash.text !== "string" || !stash.text) return
+    root.setSource(typeof stash.src === "string" && stash.src ? stash.src : "auto")
+    input.text = stash.text
+    root.translateNow()
   }
 
   function close() {
@@ -103,8 +111,27 @@ Item {
 
   function copyEnglish() {
     if (!root.result || !root.result.ok || !root.result.text) return
-    Quickshell.execDetached(["wl-copy", "--", root.result.text])
+    // Over stdin: process arguments are readable by other local users.
+    copyProc.payload = JSON.stringify({ text: root.result.text })
+    copyProc.running = true
     root.dismiss()
+  }
+
+  Process {
+    id: copyProc
+    property string payload: ""
+    command: [root.helper, "copy"]
+    stdinEnabled: true
+    onStarted: write(payload + "\n")
+  }
+
+  Process {
+    id: takeOpenProc
+    command: [root.helper, "take-open"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadStashed(text)
+    }
   }
 
   Process {

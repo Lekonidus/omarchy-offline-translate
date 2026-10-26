@@ -28,7 +28,7 @@ Then click the bar icon (󰗊) and choose **Run setup in a terminal**, or run:
 ```
 
 Setup creates a Python venv in `~/.local/share/omarchy-offline-translate/`
-(pinned `ctranslate2`, `tokenizers`, `fasttext-predict`, `numpy`) and
+(pinned `ctranslate2`, `tokenizers`, `fasttext-predict`, `numpy`, `jeepney`) and
 downloads, checksum-verified:
 
 | File | Size | RAM while loaded |
@@ -81,6 +81,16 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
 - `idleSeconds` sets how long the model stays loaded after the last
   translation. The minimum is 5.
 
+## Update
+
+```bash
+omarchy plugin update io.github.lekonidus.offline-translate
+~/.config/omarchy/plugins/io.github.lekonidus.offline-translate/bin/offline-translate setup
+```
+
+Re-running `setup` installs any new pinned packages (1.0.1 added `jeepney`).
+Models already downloaded are verified, not fetched again.
+
 ## Remove
 
 ```bash
@@ -95,6 +105,14 @@ written to disk or logged. Only a SHA-256 of the last popup's text is kept,
 in `$XDG_RUNTIME_DIR`, to avoid duplicate popups. The model server listens
 on a Unix socket in a `0700` runtime directory. Network access happens only
 during `setup`.
+
+Copied and translated text never appears in process arguments, which other
+local users can read through `/proc/<pid>/cmdline`:
+
+- Popups are sent over D-Bus from inside the helper, not through `notify-send`.
+- Text reaches `wl-copy` and the helper on stdin.
+- **Open in Translate** passes the text to the overlay through a `0600` file in
+  the runtime directory, which the overlay deletes once it has read it.
 
 ## Dependencies
 
