@@ -6,6 +6,10 @@ model. Nothing is sent to a server.
 
 Quickshell plugin for **Omarchy 4**.
 
+![Translator overlay translating Hebrew to English](docs/overlay.png)
+
+![Popup after copying Russian text](docs/popup.png)
+
 - **Copy popup:** copy non-English text anywhere and a notification shows the
   English translation, with **Copy English** and **Open in Translate**.
 - **Translator overlay:** paste text and it detects the language and
@@ -89,7 +93,8 @@ omarchy plugin update io.github.lekonidus.offline-translate
 ```
 
 Re-running `setup` installs any new pinned packages (1.0.1 added `jeepney`).
-Models already downloaded are verified, not fetched again.
+Models already downloaded are verified, not fetched again. Then run
+`omarchy restart shell`: the shell's hot reload can keep the old QML running.
 
 ## Remove
 

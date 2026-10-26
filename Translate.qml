@@ -361,11 +361,13 @@ Item {
             }
 
             QQC.ScrollView {
+              id: outputView
               width: parent.width
               height: (parent.height - root.contentSpacing) / 2
 
               TextEdit {
-                width: parent.width
+                // parent here is the scroll content, which grows with the text; wrap to the view.
+                width: outputView.availableWidth
                 readOnly: true
                 selectByMouse: true
                 wrapMode: TextEdit.Wrap
