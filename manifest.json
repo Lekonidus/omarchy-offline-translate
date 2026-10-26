@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.lekonidus.offline-translate",
+  "name": "Offline Translate",
+  "version": "1.0.0",
+  "author": "Lekonidus",
+  "license": "MIT",
+  "description": "Translate ~115 languages to English locally with NLLB-200. Pops up when you copy non-English text; the model loads only while in use.",
+  "kinds": ["overlay", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Translate.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Offline Translate",
+    "description": "Open the translator; shows when the model is loaded",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

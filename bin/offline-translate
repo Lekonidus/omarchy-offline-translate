@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Offline translation helper for the Omarchy plugin.
+
+Language detection (fastText lid.176, ~1 MB) runs in-process and is cheap.
+Translation (NLLB-200 via CTranslate2) lives in a server that starts on the
+first request and exits after `idleSeconds` without one, so the model only
+holds RAM while you are using it.
+
+Commands:
+  setup [1.3B|3.3B]   create the venv and download models
+  run                 read {"text", "src"?} as one JSON line on stdin, print result JSON
+  on-copy             wl-paste --watch handler: popup for non-English clipboard text
+  detect              read text on stdin, print detection JSON
+  status | stop | langs | popups on|off
+"""
+
+import hashlib
+import html
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+
+PLUGIN_ID = "io.github.lekonidus.offline-translate"
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy-offline-translate" / "config.json"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "omarchy-offline-translate"
+VENV_PY = DATA_DIR / "venv" / "bin" / "python"
+LID_FILE = DATA_DIR / "models" / "lid.176.ftz"
+LID_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+LID_SHA256 = "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83"
+MODELS = {
+    "1.3B": ("OpenNMT/nllb-200-distilled-1.3B-ct2-int8", "70f572adafa4794890ce7826156a4209717855af"),
+    "3.3B": ("OpenNMT/nllb-200-3.3B-ct2-int8", "28d998cc8548ad62f4f98cf8860928c3af99b97b"),
+}
+MODEL_FILES = ["config.json", "model.bin", "shared_vocabulary.json", "tokenizer.json"]
+DEFAULTS = {"model": "1.3B", "modelDir": "", "idleSeconds": 120, "clipboardPopups": True, "minConfidence": 0.5}
+MAX_CLIPBOARD = 20_000
+MAX_TEXT = 100_000
+TARGET = "eng_Latn"
+
+# fastText lid.176 label -> (NLLB-200 code, English name). Labels NLLB cannot
+# translate from are left out; they show up as "not supported".
+LANGS = {
+    "af": ("afr_Latn", "Afrikaans"), "am": ("amh_Ethi", "Amharic"), "ar": ("arb_Arab", "Arabic"),
+    "arz": ("arz_Arab", "Egyptian Arabic"), "as": ("asm_Beng", "Assamese"), "ast": ("ast_Latn", "Asturian"),
+    "az": ("azj_Latn", "Azerbaijani"), "azb": ("azb_Arab", "South Azerbaijani"), "ba": ("bak_Cyrl", "Bashkir"),
+    "be": ("bel_Cyrl", "Belarusian"), "bg": ("bul_Cyrl", "Bulgarian"), "bh": ("bho_Deva", "Bhojpuri"),
+    "bn": ("ben_Beng", "Bengali"), "bo": ("bod_Tibt", "Tibetan"), "bs": ("bos_Latn", "Bosnian"),
+    "ca": ("cat_Latn", "Catalan"), "ceb": ("ceb_Latn", "Cebuano"), "ckb": ("ckb_Arab", "Central Kurdish"),
+    "cs": ("ces_Latn", "Czech"), "cy": ("cym_Latn", "Welsh"), "da": ("dan_Latn", "Danish"),
+    "de": ("deu_Latn", "German"), "el": ("ell_Grek", "Greek"), "en": ("eng_Latn", "English"),
+    "eo": ("epo_Latn", "Esperanto"), "es": ("spa_Latn", "Spanish"), "et": ("est_Latn", "Estonian"),
+    "eu": ("eus_Latn", "Basque"), "fa": ("pes_Arab", "Persian"), "fi": ("fin_Latn", "Finnish"),
+    "fr": ("fra_Latn", "French"), "ga": ("gle_Latn", "Irish"), "gd": ("gla_Latn", "Scottish Gaelic"),
+    "gl": ("glg_Latn", "Galician"), "gn": ("grn_Latn", "Guarani"), "gu": ("guj_Gujr", "Gujarati"),
+    "he": ("heb_Hebr", "Hebrew"), "hi": ("hin_Deva", "Hindi"), "hr": ("hrv_Latn", "Croatian"),
+    "ht": ("hat_Latn", "Haitian Creole"), "hu": ("hun_Latn", "Hungarian"), "hy": ("hye_Armn", "Armenian"),
+    "id": ("ind_Latn", "Indonesian"), "ilo": ("ilo_Latn", "Ilocano"), "is": ("isl_Latn", "Icelandic"),
+    "it": ("ita_Latn", "Italian"), "ja": ("jpn_Jpan", "Japanese"), "jv": ("jav_Latn", "Javanese"),
+    "ka": ("kat_Geor", "Georgian"), "kk": ("kaz_Cyrl", "Kazakh"), "km": ("khm_Khmr", "Khmer"),
+    "kn": ("kan_Knda", "Kannada"), "ko": ("kor_Hang", "Korean"), "ku": ("kmr_Latn", "Kurdish"),
+    "ky": ("kir_Cyrl", "Kyrgyz"), "lb": ("ltz_Latn", "Luxembourgish"), "li": ("lim_Latn", "Limburgish"),
+    "lmo": ("lmo_Latn", "Lombard"), "lo": ("lao_Laoo", "Lao"), "lt": ("lit_Latn", "Lithuanian"),
+    "lv": ("lvs_Latn", "Latvian"), "mai": ("mai_Deva", "Maithili"), "mg": ("plt_Latn", "Malagasy"),
+    "mk": ("mkd_Cyrl", "Macedonian"), "ml": ("mal_Mlym", "Malayalam"), "mn": ("khk_Cyrl", "Mongolian"),
+    "mr": ("mar_Deva", "Marathi"), "ms": ("zsm_Latn", "Malay"), "mt": ("mlt_Latn", "Maltese"),
+    "my": ("mya_Mymr", "Burmese"), "ne": ("npi_Deva", "Nepali"), "nl": ("nld_Latn", "Dutch"),
+    "nn": ("nno_Latn", "Norwegian Nynorsk"), "no": ("nob_Latn", "Norwegian"), "oc": ("oci_Latn", "Occitan"),
+    "or": ("ory_Orya", "Odia"), "pa": ("pan_Guru", "Punjabi"), "pl": ("pol_Latn", "Polish"),
+    "ps": ("pbt_Arab", "Pashto"), "pt": ("por_Latn", "Portuguese"), "qu": ("quy_Latn", "Quechua"),
+    "ro": ("ron_Latn", "Romanian"), "ru": ("rus_Cyrl", "Russian"), "sa": ("san_Deva", "Sanskrit"),
+    "sc": ("srd_Latn", "Sardinian"), "scn": ("scn_Latn", "Sicilian"), "sd": ("snd_Arab", "Sindhi"),
+    "si": ("sin_Sinh", "Sinhala"), "sk": ("slk_Latn", "Slovak"), "sl": ("slv_Latn", "Slovenian"),
+    "so": ("som_Latn", "Somali"), "sq": ("als_Latn", "Albanian"), "sr": ("srp_Cyrl", "Serbian"),
+    "su": ("sun_Latn", "Sundanese"), "sv": ("swe_Latn", "Swedish"), "sw": ("swh_Latn", "Swahili"),
+    "ta": ("tam_Taml", "Tamil"), "te": ("tel_Telu", "Telugu"), "tg": ("tgk_Cyrl", "Tajik"),
+    "th": ("tha_Thai", "Thai"), "tk": ("tuk_Latn", "Turkmen"), "tl": ("tgl_Latn", "Tagalog"),
+    "tr": ("tur_Latn", "Turkish"), "tt": ("tat_Cyrl", "Tatar"), "ug": ("uig_Arab", "Uyghur"),
+    "uk": ("ukr_Cyrl", "Ukrainian"), "ur": ("urd_Arab", "Urdu"), "uz": ("uzn_Latn", "Uzbek"),
+    "vec": ("vec_Latn", "Venetian"), "vi": ("vie_Latn", "Vietnamese"), "war": ("war_Latn", "Waray"),
+    "yi": ("ydd_Hebr", "Yiddish"), "yo": ("yor_Latn", "Yoruba"), "yue": ("yue_Hant", "Cantonese"),
+    "zh": ("zho_Hans", "Chinese"),
+}
+
+# Sentence ends, including CJK, Arabic and Devanagari marks. CJK marks are
+# not followed by spaces, so the space is optional.
+SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|(?<=[。！？؟।])\s*")
+
+
+def run_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base:
+        sys.exit("XDG_RUNTIME_DIR is not set")
+    path = Path(base) / "omarchy-offline-translate"
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def load_config():
+    try:
+        user = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        user = {}
+    cfg = dict(DEFAULTS)
+    cfg.update({k: v for k, v in user.items() if k in DEFAULTS and type(v) is type(DEFAULTS[k])})
+    return cfg
+
+
+def save_config(**changes):
+    try:
+        user = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        user = {}
+    user.update(changes)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(user, indent=2) + "\n")
+    tmp.replace(CONFIG_FILE)
+
+
+def model_dir(cfg):
+    if cfg["modelDir"]:
+        return Path(cfg["modelDir"]).expanduser()
+    return DATA_DIR / "models" / cfg["model"]
+
+
+def is_installed(cfg):
+    return VENV_PY.is_file() and LID_FILE.is_file() and all((model_dir(cfg) / f).is_file() for f in MODEL_FILES)
+
+
+# ---------------------------------------------------------------- detection
+
+_lid = None
+
+
+def detect(text):
+    """Return (lid label, confidence) for text."""
+    global _lid
+    if _lid is None:
+        import fasttext
+        _lid = fasttext.load_model(str(LID_FILE))
+    labels, probs = _lid.predict(" ".join(text.split())[:2000], k=1)
+    return labels[0].removeprefix("__label__"), min(1.0, float(probs[0]))
+
+
+def is_latin(text):
+    letters = [c for c in text if c.isalpha()]
+    return all("LATIN" in unicodedata.name(c, "") for c in letters)
+
+
+def should_popup(text, label, conf, min_conf):
+    """Whether copied text is confidently non-English and worth a popup."""
+    if sum(c.isalpha() for c in text) < 4:
+        return False
+    if len(text.split()) == 1 and ("://" in text or text.startswith(("/", "~", "."))):
+        return False
+    if label == "en" or label not in LANGS:
+        return False
+    # Short Latin-script snippets ("ok", "Merci", identifiers) are where
+    # detection guesses; demand much more confidence there.
+    if is_latin(text) and len(text.split()) < 3:
+        return conf >= 0.9
+    return conf >= min_conf
+
+
+# -------------------------------------------------------------- translation
+
+def split_text(text, short=12):
+    """Lines of sentences: [[sentence, ...], ...]. Blank lines are [].
+
+    NLLB drops sentences when given several at once, and invents dialogue
+    around a lone "Hi!", so fragments shorter than `short` characters ride
+    along with the next sentence.
+    """
+    out = []
+    for line in text.split("\n"):
+        chunks = []
+        for sentence in filter(None, SENTENCE_END.split(line.strip())):
+            if chunks and len(chunks[-1]) < short:
+                chunks[-1] += " " + sentence
+            else:
+                chunks.append(sentence)
+        out.append(chunks)
+    return out
+
+
+def join_text(lines):
+    return "\n".join(" ".join(line) for line in lines)
+
+
+class Translator:
+    def __init__(self, path):
+        import ctranslate2
+        from tokenizers import Tokenizer
+        self.tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+        self.model = ctranslate2.Translator(str(path), device="cpu", compute_type="int8",
+                                            intra_threads=os.cpu_count() or 4)
+
+    def __call__(self, sentences, src, window=200):
+        # A run-on sentence past the model's comfortable length is cut into
+        # token windows rather than truncated.
+        batch, owner = [], []
+        for n, sentence in enumerate(sentences):
+            tokens = self.tokenizer.encode(sentence, add_special_tokens=False).tokens
+            for start in range(0, max(1, len(tokens)), window):
+                batch.append([src, *tokens[start:start + window], "</s>"])
+                owner.append(n)
+        results = self.model.translate_batch(
+            batch, target_prefix=[[TARGET]] * len(batch), beam_size=2,
+            max_decoding_length=320, max_batch_size=2048, batch_type="tokens")
+        out = [[] for _ in sentences]
+        for n, result in zip(owner, results):
+            tokens = result.hypotheses[0]
+            if tokens and tokens[0] == TARGET:
+                tokens = tokens[1:]
+            ids = [i for t in tokens if (i := self.tokenizer.token_to_id(t)) is not None]
+            out[n].append(self.tokenizer.decode(ids, skip_special_tokens=True).strip())
+        return [" ".join(parts) for parts in out]
+
+
+class FakeTranslator:
+    """OMARCHY_TRANSLATE_FAKE=1: no model, for tests."""
+
+    def __init__(self, path):
+        time.sleep(float(os.environ.get("OMARCHY_TRANSLATE_FAKE_LOAD", "0")))
+
+    def __call__(self, sentences, src):
+        return [f"[{src}] {s}" for s in sentences]
+
+
+def translate_text(translator, text, src_label):
+    src = LANGS[src_label][0]
+    lines = split_text(text)
+    flat = [s for line in lines for s in line]
+    done = iter(translator(flat, src) if flat else [])
+    return join_text([[next(done) for _ in line] for line in lines])
+
+
+def handle(req, state, cfg):
+    text = req.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return {"ok": False, "error": "No text"}
+    if len(text) > MAX_TEXT:
+        return {"ok": False, "error": f"Text is longer than {MAX_TEXT} characters"}
+    label = req.get("src") or ""
+    conf = None
+    if not label or label == "auto":
+        label, conf = detect(text)
+    base = {"ok": True, "src": label, "name": LANGS.get(label, ("", label))[1], "confidence": conf}
+    if label == "en":
+        return {**base, "text": text, "note": "Already English"}
+    if label not in LANGS:
+        return {"ok": False, "src": label, "confidence": conf, "error": f"Language '{label}' is not supported"}
+    if state["translator"] is None:
+        write_state(loaded="loading", model=state["label"])
+        cls = FakeTranslator if os.environ.get("OMARCHY_TRANSLATE_FAKE") == "1" else Translator
+        try:
+            state["translator"] = cls(model_dir(cfg))
+        finally:
+            write_state(loaded=state["translator"] is not None, model=state["label"])
+    return {**base, "text": translate_text(state["translator"], text, label)}
+
+
+# ------------------------------------------------------------------- server
+
+def write_state(**state):
+    path = run_dir() / "state.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pid": os.getpid(), **state}))
+    tmp.replace(path)
+
+
+def read_state():
+    try:
+        return json.loads((run_dir() / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def recv_line(conn, limit=4 * MAX_TEXT + 1024):
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError("request too large")
+    return json.loads(buf or b"null")
+
+
+def serve():
+    import fcntl
+    import signal
+    rd = run_dir()
+    lock = open(rd / "server.lock", "w")
+    # Clients that all found no server each spawn one. The lock holder may be
+    # serving (we leave), still starting, or exiting on idle (it unlinks the
+    # socket before releasing the lock, so we never remove a live socket).
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            try:
+                _send({"op": "ping"}, 2)
+                return
+            except OSError:
+                if time.monotonic() > deadline:
+                    return
+                time.sleep(0.1)
+    cfg = load_config()
+    sock_path = rd / "sock"
+    sock_path.unlink(missing_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(16)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    label = "custom" if cfg["modelDir"] else cfg["model"]
+    state = {"translator": None, "label": label}
+    write_state(loaded=False, model=label)
+    srv.settimeout(max(5, cfg["idleSeconds"]))
+    try:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                break
+            with conn:
+                conn.settimeout(30)
+                try:
+                    req = recv_line(conn)
+                    if not isinstance(req, dict):
+                        raise ValueError("bad request")
+                    # Never log the text itself.
+                    print(time.strftime("%F %T"), req.get("op"), len(str(req.get("text") or "")), "chars",
+                          file=sys.stderr, flush=True)
+                    if req.get("op") in ("stop", "ping"):
+                        conn.sendall(b'{"ok": true}\n')
+                        if req["op"] == "stop":
+                            break
+                        continue
+                    conn.settimeout(None)
+                    resp = handle(req, state, cfg)
+                except Exception as e:  # report to the client, keep serving
+                    resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                try:
+                    conn.sendall(json.dumps(resp).encode() + b"\n")
+                except OSError:
+                    pass
+    finally:
+        sock_path.unlink(missing_ok=True)
+        (rd / "state.json").unlink(missing_ok=True)
+
+
+def _send(payload, timeout):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(run_dir() / "sock"))
+        s.sendall(json.dumps(payload).encode() + b"\n")
+        resp = recv_line(s)
+    if resp is None:
+        raise ConnectionResetError("server closed the connection")
+    return resp
+
+
+def request(payload, timeout=600):
+    """Send one request, starting the server if it isn't running."""
+    retry = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)
+    try:
+        return _send(payload, timeout)
+    except retry:
+        pass
+    log = open(run_dir() / "server.log", "ab")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "serve"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, close_fds=True)
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            return _send(payload, timeout)
+        except retry:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
+
+
+# -------------------------------------------------------------------- popup
+
+def notify(args):
+    out = subprocess.run(["notify-send", "-a", "Offline Translate", *args],
+                         capture_output=True, text=True).stdout.split()
+    return out
+
+
+def popup(text, label):
+    """Show a notification with the translation; act on Copy / Open."""
+    rd = run_dir()
+    current = rd / "popup.json"
+    try:
+        prev_id = json.loads(current.read_text()).get("id", "")
+    except (OSError, ValueError):
+        prev_id = ""
+    token = hashlib.sha256(f"{os.getpid()}{time.time()}".encode()).hexdigest()[:12]
+    name = LANGS[label][1]
+    title = f"{name} → English"
+    state = read_state()
+    waiting = "Translating…" if state and state.get("loaded") is True else "Loading the translation model…"
+    replace = ["-r", prev_id] if prev_id.isdigit() else []
+    nid = (notify(["-p", *replace, title, waiting]) or [""])[0]
+    current.write_text(json.dumps({"token": token, "id": nid}))
+    try:
+        resp = request({"op": "translate", "text": text, "src": label})
+    except OSError as e:
+        resp = {"ok": False, "error": str(e)}
+
+    def still_current():
+        try:
+            return json.loads(current.read_text()).get("token") == token
+        except (OSError, ValueError):
+            return False
+
+    if not still_current():
+        return  # a newer copy took over this notification
+    replace = ["-r", nid] if nid.isdigit() else []
+    if not resp.get("ok"):
+        notify([*replace, "Translation failed", html.escape(resp.get("error", "unknown error"), quote=False)])
+        return
+    english = resp["text"]
+    body = english if len(english) <= 600 else english[:600].rstrip() + "…"
+    picked = notify([*replace, "-A", "copy=Copy English", "-A", "open=Open in Translate",
+                     title, html.escape(body, quote=False)])
+    if "copy" in picked:
+        subprocess.run(["wl-copy"], input=english, text=True)
+    elif "open" in picked:
+        subprocess.run(["omarchy-shell", "shell", "summon", PLUGIN_ID, json.dumps({"text": text, "src": label})])
+
+
+def parent_age():
+    """Seconds since our parent (wl-paste --watch) started."""
+    try:
+        start_ticks = int(Path(f"/proc/{os.getppid()}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return 1e9
+
+
+def on_copy():
+    cfg = load_config()
+    if not cfg["clipboardPopups"] or os.environ.get("CLIPBOARD_STATE") == "sensitive":
+        return
+    # wl-paste --watch reports what's already on the clipboard when it starts
+    # (login, shell or plugin reload). That isn't a copy; don't pop up or
+    # load the model for it.
+    if os.environ.get("OMARCHY_TRANSLATE_INITIAL_OK") != "1" and parent_age() < 1.5:
+        return
+    raw = sys.stdin.buffer.read(MAX_CLIPBOARD + 1)
+    if not raw or len(raw) > MAX_CLIPBOARD:
+        return
+    try:
+        types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=2).stdout.split()
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if "x-kde-passwordManagerHint" in types:
+        return  # password managers mark secrets this way
+    text = raw.decode("utf-8", "replace").strip()
+    if not is_installed(cfg):
+        return
+    label, conf = detect(text)
+    if not should_popup(text, label, conf, cfg["minConfidence"]):
+        return
+    # Same text copied again (or re-announced) shortly after: one popup is enough.
+    seen = run_dir() / "last-copy"
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    try:
+        if seen.read_text() == digest and time.time() - seen.stat().st_mtime < 10:
+            return
+    except OSError:
+        pass
+    seen.write_text(digest)
+    # Detach so wl-paste gets its next event while we translate and wait on the popup.
+    if os.fork():
+        return
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    try:
+        popup(text, label)
+    finally:
+        os._exit(0)
+
+
+# -------------------------------------------------------------------- setup
+
+def download(url, dest, sha256=None, sha1_git=None):
+    import urllib.request
+    if dest.is_file() and verify(dest, sha256, sha1_git):
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    print(f"Downloading {dest.name}…", flush=True)
+    with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got, last = 0, -1
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            got += len(chunk)
+            pct = got * 100 // total if total else -1
+            if pct != last and pct % 5 == 0:
+                print(f"  {pct}% of {total / 1e9:.2f} GB", flush=True)
+                last = pct
+    if not verify(part, sha256, sha1_git):
+        part.unlink()
+        sys.exit(f"Checksum mismatch for {dest.name}; download removed")
+    part.replace(dest)
+
+
+def verify(path, sha256=None, sha1_git=None):
+    if sha256:
+        h = hashlib.sha256()
+    elif sha1_git:
+        h = hashlib.sha1(f"blob {path.stat().st_size}\0".encode())
+    else:
+        return True
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest() == (sha256 or sha1_git)
+
+
+def setup(key):
+    import urllib.request
+    if key and key not in MODELS:
+        sys.exit(f"Unknown model {key}; choose {' or '.join(MODELS)}")
+    cfg = load_config()
+    key = key or cfg["model"]
+    if not VENV_PY.is_file():
+        # ctranslate2 ships wheels for the distro Python before newer ones.
+        base = "/usr/bin/python3" if Path("/usr/bin/python3").is_file() else sys.executable
+        subprocess.check_call([base, "-m", "venv", str(VENV_PY.parent.parent)])
+    subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--disable-pip-version-check", "-q",
+                           "-r", str(PLUGIN_DIR / "requirements.txt")])
+    download(LID_URL, LID_FILE, sha256=LID_SHA256)
+    if cfg["modelDir"]:
+        print(f"Using modelDir {cfg['modelDir']} from config; skipping model download")
+    else:
+        repo, rev = MODELS[key]
+        with urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/{rev}", timeout=60) as r:
+            tree = {e["path"]: e for e in json.load(r)}
+        for name in MODEL_FILES:
+            entry = tree[name]
+            lfs = entry.get("lfs")
+            download(f"https://huggingface.co/{repo}/resolve/{rev}/{name}", DATA_DIR / "models" / key / name,
+                     sha256=lfs["oid"] if lfs else None, sha1_git=None if lfs else entry["oid"])
+        save_config(model=key)
+    print("Offline Translate is ready.")
+
+
+# --------------------------------------------------------------------- main
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    # Everything but setup and langs needs the venv's packages.
+    if cmd not in ("setup", "langs", "popups", "status") and VENV_PY.is_file() and Path(sys.prefix) != VENV_PY.parent.parent:
+        os.execv(str(VENV_PY), [str(VENV_PY), str(Path(__file__).resolve()), *argv])
+    if cmd == "setup":
+        setup(argv[1] if len(argv) > 1 else "")
+    elif cmd == "serve":
+        serve()
+    elif cmd == "run":
+        try:
+            req = json.loads(sys.stdin.readline())
+            resp = request({"op": "translate", "text": req.get("text"), "src": req.get("src") or ""})
+        except Exception as e:
+            resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        print(json.dumps(resp), flush=True)
+    elif cmd == "on-copy":
+        on_copy()
+    elif cmd == "detect":
+        text = sys.stdin.read()
+        label, conf = detect(text)
+        print(json.dumps({"src": label, "name": LANGS.get(label, ("", label))[1], "confidence": conf,
+                          "popup": should_popup(text.strip(), label, conf, load_config()["minConfidence"])}))
+    elif cmd == "stop":
+        try:
+            _send({"op": "stop"}, 5)
+        except OSError:
+            pass
+    elif cmd == "status":
+        cfg = load_config()
+        print(json.dumps({"installed": is_installed(cfg), "server": read_state(), "config": cfg}))
+    elif cmd == "langs":
+        print(json.dumps(sorted(({"value": k, "label": v[1]} for k, v in LANGS.items() if k != "en"),
+                                key=lambda o: o["label"])))
+    elif cmd == "popups" and len(argv) > 1 and argv[1] in ("on", "off", "toggle"):
+        on = (not load_config()["clipboardPopups"]) if argv[1] == "toggle" else argv[1] == "on"
+        save_config(clipboardPopups=on)
+        print("on" if on else "off")
+    else:
+        print(__doc__.strip())
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
