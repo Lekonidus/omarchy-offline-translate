@@ -78,6 +78,81 @@ class TextStructure(unittest.TestCase):
         line = "word " * 300
         self.assertEqual(ot.split_text(line), [[line.strip()]])
 
+WORDNET = """<?xml version="1.0" encoding="UTF-8"?>
+<LexicalResource><Lexicon id="oewn" language="en">
+  <LexicalEntry id="oewn-mouse-n"><Lemma writtenForm="mouse" partOfSpeech="n"><Pronunciation>maʊs</Pronunciation></Lemma>
+    <Form writtenForm="mice"/><Sense id="m1" synset="oewn-1-n"/></LexicalEntry>
+  <LexicalEntry id="oewn-study-v"><Lemma writtenForm="study" partOfSpeech="v"/>
+    <Sense id="s1" synset="oewn-2-v"/><Sense id="s2" synset="oewn-3-v"/></LexicalEntry>
+  <LexicalEntry id="oewn-analyze-v"><Lemma writtenForm="analyze" partOfSpeech="v"/><Sense id="a1" synset="oewn-2-v"/></LexicalEntry>
+  <LexicalEntry id="oewn-give_up-v"><Lemma writtenForm="give up" partOfSpeech="v"/><Sense id="g1" synset="oewn-4-v"/></LexicalEntry>
+  <LexicalEntry id="oewn-brief-a"><Lemma writtenForm="brief" partOfSpeech="a"/><Sense id="b1" synset="oewn-5-a"/></LexicalEntry>
+  <LexicalEntry id="oewn-brief-s"><Lemma writtenForm="brief" partOfSpeech="s"/><Sense id="b2" synset="oewn-6-s"/></LexicalEntry>
+  <Synset id="oewn-1-n" members="oewn-mouse-n" partOfSpeech="n"><Definition>a small rodent &lt;b&gt;</Definition></Synset>
+  <Synset id="oewn-2-v" members="oewn-study-v oewn-analyze-v" partOfSpeech="v"><Definition>consider in detail</Definition>
+    <Example>study the situation</Example><Example>two</Example><Example>three</Example></Synset>
+  <Synset id="oewn-3-v" members="oewn-study-v" partOfSpeech="v"><Definition>be a student</Definition></Synset>
+  <Synset id="oewn-4-v" members="oewn-give_up-v" partOfSpeech="v"><Definition>stop trying</Definition></Synset>
+  <Synset id="oewn-5-a" members="oewn-brief-a" partOfSpeech="a"><Definition>of short duration</Definition></Synset>
+  <Synset id="oewn-6-s" members="oewn-brief-s" partOfSpeech="s"><Definition>concise</Definition></Synset>
+</Lexicon></LexicalResource>
+"""
+
+
+def build_fixture_dictionary(data_dir):
+    import gzip
+    gz = Path(data_dir) / "wn.xml.gz"
+    gz.parent.mkdir(parents=True, exist_ok=True)
+    gz.write_bytes(gzip.compress(WORDNET.encode()))
+    dest = Path(data_dir) / "omarchy-offline-translate" / "models" / "oewn-2025.sqlite"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ot.build_dictionary(gz, dest)
+    return dest
+
+
+class Dictionary(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.real, ot.DICT_FILE = ot.DICT_FILE, build_fixture_dictionary(self.tmp.name)
+
+    def tearDown(self):
+        ot.DICT_FILE = self.real
+        self.tmp.cleanup()
+
+    def words(self, text):
+        entries = ot.lookup(text)
+        return entries and [(e["word"], e["pos"]) for e in entries]
+
+    def test_lemmas_irregular_and_regular_forms(self):
+        self.assertEqual(self.words("mouse"), [("mouse", "noun")])
+        self.assertEqual(self.words("mice"), [("mouse", "noun")])
+        self.assertEqual(self.words("studies"), [("study", "verb")])
+        self.assertEqual(self.words("studied"), [("study", "verb")])
+        self.assertEqual(self.words("  Give   up. "), [("give up", "verb")])
+        self.assertEqual(self.words("Mouse’s"), None)
+
+    def test_not_words(self):
+        for text in ["getUser", "/usr/bin", "a b c d", "mouse mouse mouse mouse", "x" * 41, "1234", "שלום", ""]:
+            with self.subTest(text=text):
+                self.assertIsNone(ot.lookup(text))
+
+    def test_satellite_adjectives_merge_and_synonyms_exclude_the_word(self):
+        brief = ot.lookup("brief")
+        self.assertEqual([len(e["senses"]) for e in brief], [2])
+        study = ot.lookup("study")[0]["senses"][0]
+        self.assertEqual(study["syn"], ["analyze"])
+        self.assertEqual(study["ex"], ["study the situation", "two"], "two examples at most")
+
+    def test_format(self):
+        full = ot.format_entries(ot.lookup("study"))
+        self.assertIn("study (verb)\n  1. consider in detail\n     \u201cstudy the situation\u201d", full)
+        self.assertIn("Synonyms: analyze", full)
+        self.assertEqual(ot.format_entries(ot.lookup("mice"), brief=True), "mouse (noun)  /maʊs/\n  1. a small rodent <b>")
+
+    def test_missing_dictionary_is_no_entry(self):
+        ot.DICT_FILE = Path(self.tmp.name) / "missing.sqlite"
+        self.assertIsNone(ot.lookup("mouse"))
+
 
 @unittest.skipUnless(HAVE_LID, "run offline-translate setup first")
 class Detection(unittest.TestCase):
@@ -347,6 +422,40 @@ class OnCopy(Isolated):
         self.assertEqual(self.helper("popups", "off").stdout.strip(), "off")
         self.assertEqual(self.helper("popups", "toggle").stdout.strip(), "on")
         self.assertTrue(json.loads(self.helper("status").stdout)["config"]["clipboardPopups"])
+
+    def use_fixture_dictionary(self):
+        data = Path(self.tmp.name) / "data"
+        build_fixture_dictionary(data)
+        self.env["XDG_DATA_HOME"] = str(data)
+
+    def test_english_word_shows_definitions_and_copy_works(self):
+        self.use_fixture_dictionary()
+        self.server.action = "copy"
+        self.assertTrue(self.on_copy("Mice"))
+        (bubble,) = self.notifications(1)
+        self.assertEqual(bubble["summary"], "Dictionary")
+        self.assertEqual(bubble["body"], "mouse (noun)  /maʊs/\n  1. a small rodent &lt;b&gt;")
+        self.assertEqual(bubble["actions"], ["copy", "Copy definition", "open", "Open in Translate"])
+        self.assertEqual(self.wait_for(self.copied), "mouse (noun)  /maʊs/\n  1. a small rodent <b>")
+
+    def test_dictionary_open_stashes_auto_source(self):
+        self.use_fixture_dictionary()
+        self.server.action = "open"
+        self.on_copy("give up")
+        self.wait_for(self.summoned)
+        self.assertEqual(json.loads(self.helper("take-open").stdout), {"text": "give up", "src": "auto"})
+
+    def test_dictionary_off_falls_back_to_ignoring_english(self):
+        self.use_fixture_dictionary()
+        self.assertEqual(self.helper("dictionary", "off").stdout.strip(), "off")
+        self.assertFalse(self.on_copy("mice"))
+
+    def test_overlay_looks_up_words_without_the_server(self):
+        self.use_fixture_dictionary()
+        resp = self.run_translate("studies", src="auto")
+        self.assertEqual((resp["note"], resp["text"].splitlines()[0]), ("Dictionary", "study (verb)"))
+        self.assertFalse((self.rd / "sock").exists(), "no model server for a lookup")
+        self.assertEqual(self.run_translate("study", src="fr")["text"], "[fra_Latn] study", "a forced language translates")
 
 
 class FirstRunHint(Isolated):

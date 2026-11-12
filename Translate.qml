@@ -42,7 +42,7 @@ Item {
   readonly property string statusText: {
     if (!root.installed) return ""
     if (root.busy) return root.server && root.server.loaded === true ? "Translating…" : "Loading the translation model…"
-    if (!root.result) return input.text.trim() ? "" : "Paste text in any language — it translates to English as you paste."
+    if (!root.result) return input.text.trim() ? "" : "Paste text in any language — it translates to English as you paste. An English word or short phrase shows its definitions."
     if (!root.result.ok) return root.result.error || "Translation failed"
     var name = root.result.name || root.result.src
     if (root.result.note) return name + " · " + root.result.note

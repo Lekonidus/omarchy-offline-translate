@@ -2,7 +2,8 @@
 
 Translate text from about 115 languages to English **on your own computer**
 with Meta's [NLLB-200](https://ai.meta.com/research/no-language-left-behind/)
-model. Nothing is sent to a server.
+model, plus an offline English dictionary
+([Open English WordNet](https://en-word.net/)). Nothing is sent to a server.
 
 Quickshell plugin for **Omarchy 4**.
 
@@ -12,8 +13,14 @@ Quickshell plugin for **Omarchy 4**.
 
 - **Copy popup:** copy non-English text anywhere and a notification shows the
   English translation, with **Copy English** and **Open in Translate**.
+- **Dictionary popup:** copy an English word or short phrase (up to three
+  words, like `serendipity`, `mice`, `give up`) and a notification shows its
+  definitions with **Copy definition** and **Open in Translate**. Inflected
+  forms find their base word (`studies` → `study`, `ran` → `run`).
 - **Translator overlay:** paste text and it detects the language and
-  translates as you paste. You can override the detected language.
+  translates as you paste. You can override the detected language. An English
+  word or short phrase shows its full entry: pronunciation, every sense,
+  examples and synonyms.
 - **Model only in RAM while in use:** the model loads on the first
   translation and unloads after 2 minutes idle. In between, nothing runs
   except a tiny `wl-paste` watcher. Each copy costs about 70 ms of language
@@ -49,6 +56,10 @@ downloads, checksum-verified:
 | fastText `lid.176.ftz` (language ID) | 1 MB | — |
 | NLLB-200 distilled 1.3B, int8 (default) | 1.4 GB | ~1.6 GB |
 | NLLB-200 3.3B, int8 (optional: `setup 3.3B`) | 3.3 GB | ~3.6 GB |
+| Open English WordNet 2025 (dictionary, 11 MB download) | 43 MB SQLite | — |
+
+Dictionary lookups don't use the model or the server: they are SQLite
+queries in the helper and take about a millisecond.
 
 A translation takes about 0.5 s when the model is loaded and about 2 s
 from cold on a modern CPU.
@@ -70,7 +81,7 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
 - **Overlay:** `Ctrl+V` to paste, `Ctrl+Enter` copies the English and closes,
   `Esc` closes. Use the language picker when detection guesses wrong (short
   text, names, mixed languages).
-- **Popups** skip English, very short Latin-script snippets, URLs and paths,
+- **Popups** skip English text (except dictionary words), very short Latin-script snippets, URLs and paths,
   clipboard over 20,000 characters, and anything a password manager marks as
   secret (`x-kde-passwordManagerHint`).
 
@@ -84,9 +95,14 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
   "modelDir": "",
   "idleSeconds": 120,
   "clipboardPopups": true,
-  "minConfidence": 0.5
+  "minConfidence": 0.5,
+  "dictionaryPopups": true
 }
 ```
+
+- `dictionaryPopups: false` (or `bin/offline-translate dictionary off`) stops
+  popups for copied English words; translation popups and the overlay's
+  dictionary keep working.
 
 - `modelDir` points at an existing CTranslate2 NLLB model directory instead
   of the downloaded one. It must contain `model.bin`, `config.json`,
@@ -101,7 +117,8 @@ omarchy plugin update io.github.lekonidus.offline-translate
 ~/.config/omarchy/plugins/io.github.lekonidus.offline-translate/bin/offline-translate setup
 ```
 
-Re-running `setup` installs any new pinned packages (1.0.1 added `jeepney`).
+Re-running `setup` installs any new pinned packages (1.0.1 added `jeepney`)
+and builds anything new (1.1.0 added the dictionary).
 Models already downloaded are verified, not fetched again. Then run
 `omarchy restart shell`: the shell's hot reload can keep the old QML running.
 
@@ -150,3 +167,5 @@ are **not** covered by this license:
   non-commercial use only.
 - fastText `lid.176` (Meta):
   [CC-BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/).
+- Open English WordNet 2025 (Global WordNet Association, based on Princeton
+  WordNet): [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).

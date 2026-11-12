@@ -6,6 +6,9 @@ Translation (NLLB-200 via CTranslate2) lives in a server that starts on the
 first request and exits after `idleSeconds` without one, so the model only
 holds RAM while you are using it.
 
+English words and short phrases are looked up in a local SQLite build of
+Open English WordNet instead (in-process, no model, a few ms).
+
 Commands:
   setup [1.3B|3.3B]   create the venv and download models
   run                 read {"text", "src"?} as one JSON line on stdin, print result JSON
@@ -14,7 +17,7 @@ Commands:
   copy                read {"text"} as one JSON line on stdin, put it on the clipboard
   take-open           print and delete the text a popup's "Open" stashed for the overlay
   first-run-hint      once after install, a notification offering to run setup
-  status | stop | langs | popups on|off
+  status | stop | langs | popups on|off | dictionary on|off
 """
 
 import hashlib
@@ -23,6 +26,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -43,7 +47,11 @@ MODELS = {
     "3.3B": ("OpenNMT/nllb-200-3.3B-ct2-int8", "28d998cc8548ad62f4f98cf8860928c3af99b97b"),
 }
 MODEL_FILES = ["config.json", "model.bin", "shared_vocabulary.json", "tokenizer.json"]
-DEFAULTS = {"model": "1.3B", "modelDir": "", "idleSeconds": 120, "clipboardPopups": True, "minConfidence": 0.5}
+DEFAULTS = {"model": "1.3B", "modelDir": "", "idleSeconds": 120, "clipboardPopups": True, "minConfidence": 0.5,
+            "dictionaryPopups": True}
+DICT_FILE = DATA_DIR / "models" / "oewn-2025.sqlite"
+DICT_URL = "https://github.com/globalwordnet/english-wordnet/releases/download/2025-edition/english-wordnet-2025.xml.gz"
+DICT_SHA256 = "9ca6d1dcb75f822fdd66617f7d9da48142ace38dd544d6ad5e2feca1674ad3fe"
 MAX_CLIPBOARD = 20_000
 MAX_TEXT = 100_000
 TARGET = "eng_Latn"
@@ -171,6 +179,99 @@ def should_popup(text, label, conf, min_conf):
     if is_latin(text) and len(text.split()) < 3:
         return conf >= 0.9
     return conf >= min_conf
+
+
+# --------------------------------------------------------------- dictionary
+
+POS_NAMES = {"n": "noun", "v": "verb", "a": "adjective", "s": "adjective", "r": "adverb"}
+# WordNet's morphy suffix rules plus -ied/-ier/-iest, for regular inflections ("studies" -> "study").
+# Irregular ones ("mice", "ran", "running") are listed in the data itself.
+# ponytail: rules apply regardless of part of speech, so "bases" also tries "bas"; misses only cost a query.
+SUFFIXES = [("s", ""), ("ses", "s"), ("xes", "x"), ("zes", "z"), ("ches", "ch"), ("shes", "sh"), ("men", "man"),
+            ("ies", "y"), ("ied", "y"), ("ier", "y"), ("iest", "y"), ("es", "e"), ("es", ""), ("ed", "e"), ("ed", ""), ("ing", "e"), ("ing", ""),
+            ("er", ""), ("est", ""), ("er", "e"), ("est", "e")]
+WORDS = re.compile(r"[A-Za-z][A-Za-z'.-]*(?: [A-Za-z'.-]+){0,2}")  # one to three words
+
+
+def lookup(text):
+    """Dictionary entries for an English word or phrase of up to three words, or None."""
+    word = " ".join(text.replace("’", "'").split()).strip(".,;:!?\"'()[]“”")
+    if len(word) > 40 or not WORDS.fullmatch(word) or not DICT_FILE.is_file():
+        return None
+    key = word.lower()
+    db = sqlite3.connect(f"file:{DICT_FILE}?mode=ro", uri=True)
+    try:
+        for keys in ([key], [key[:-len(a)] + b for a, b in SUFFIXES if key.endswith(a) and len(key) > len(a) + 1]):
+            rows = []
+            for k in dict.fromkeys(keys):
+                rows += db.execute("SELECT data FROM words WHERE key = ? UNION ALL SELECT w.data FROM forms f "
+                                   "JOIN words w ON w.key = f.lemma WHERE f.form = ?", (k, k)).fetchall()
+            if rows:
+                return [entry for data in dict.fromkeys(r[0] for r in rows) for entry in json.loads(data)]
+    finally:
+        db.close()
+    return None
+
+
+def format_entries(entries, brief=False):
+    """Plain-text definitions; brief: three senses per part of speech, no examples."""
+    out = []
+    for e in entries:
+        out.append(f"{e['word']} ({e['pos']})" + (f"  /{e['ipa']}/" if e["ipa"] else ""))
+        for n, s in enumerate(e["senses"][:3] if brief else e["senses"], 1):
+            out.append(f"  {n}. {s['def']}")
+            if not brief:
+                out += [f"     “{x}”" for x in s["ex"]]
+                if s["syn"]:
+                    out.append("     Synonyms: " + ", ".join(s["syn"]))
+        if brief and len(e["senses"]) > 3:
+            out.append(f"  … {len(e['senses']) - 3} more")
+    return "\n".join(out)
+
+
+def build_dictionary(xml_gz, dest):
+    """Open English WordNet (WN-LMF XML) -> SQLite: words(key, JSON entries), forms(form, lemma)."""
+    import gzip
+    import xml.etree.ElementTree as ET
+    entries, forms, synsets, names = {}, set(), {}, {}
+    with gzip.open(xml_gz) as f:
+        for _, el in ET.iterparse(f):
+            if el.tag == "LexicalEntry":
+                lemma = el.find("Lemma")
+                word = lemma.get("writtenForm")
+                names[el.get("id")] = word
+                entries.setdefault(word.lower(), []).append(
+                    (word, POS_NAMES[lemma.get("partOfSpeech")], lemma.findtext("Pronunciation") or "",
+                     [s.get("synset") for s in el.iter("Sense")]))
+                forms |= {(form.get("writtenForm").lower(), word.lower()) for form in el.iter("Form")}
+                el.clear()
+            elif el.tag == "Synset":
+                synsets[el.get("id")] = (el.findtext("Definition") or "", [x.text for x in el.iter("Example")][:2],
+                                         el.get("members", "").split())
+                el.clear()
+    order = list(dict.fromkeys(POS_NAMES.values()))
+    part = dest.with_name(dest.name + ".part")
+    part.unlink(missing_ok=True)
+    db = sqlite3.connect(part)
+    db.execute("CREATE TABLE words (key TEXT PRIMARY KEY, data TEXT NOT NULL) WITHOUT ROWID")
+    db.execute("CREATE TABLE forms (form TEXT NOT NULL, lemma TEXT NOT NULL)")
+    rows = []
+    for key, items in entries.items():
+        merged = {}  # (word, pos) -> entry; satellite adjectives join their adjective
+        for word, pos, ipa, sids in items:
+            e = merged.setdefault((word, pos), {"word": word, "pos": pos, "ipa": ipa, "senses": []})
+            for sid in sids:
+                gloss, ex, members = synsets[sid]
+                e["senses"].append({"def": gloss, "ex": ex, "syn": [names[m] for m in members if names[m] != word]})
+        data = sorted(merged.values(), key=lambda e: (e["word"] != e["word"].lower(), order.index(e["pos"])))
+        rows.append((key, json.dumps(data, ensure_ascii=False)))
+    db.executemany("INSERT INTO words VALUES (?, ?)", rows)
+    db.executemany("INSERT INTO forms VALUES (?, ?)", sorted(forms))
+    db.execute("CREATE INDEX forms_form ON forms (form)")
+    db.commit()
+    db.execute("VACUUM")
+    db.close()
+    part.replace(dest)
 
 
 # -------------------------------------------------------------- translation
@@ -452,8 +553,8 @@ def wl_copy(text):
     subprocess.run(["wl-copy"], input=text, text=True)
 
 
-def popup(text, label):
-    """Show a notification with the translation; act on Copy / Open."""
+def popup(text, label, entries=None):
+    """Show a notification with the translation or definitions; act on Copy / Open."""
     try:
         notifier = Notifier()
     except ImportError:
@@ -468,15 +569,6 @@ def popup(text, label):
     except (OSError, ValueError, TypeError):
         prev_id = 0
     token = hashlib.sha256(f"{os.getpid()}{time.time()}".encode()).hexdigest()[:12]
-    title = f"{LANGS[label][1]} → English"
-    state = read_state()
-    waiting = "Translating…" if state and state.get("loaded") is True else "Loading the translation model…"
-    nid = notifier.notify(title, waiting, replaces=prev_id)
-    current.write_text(json.dumps({"token": token, "id": nid}))
-    try:
-        resp = request({"op": "translate", "text": text, "src": label})
-    except OSError as e:
-        resp = {"ok": False, "error": str(e)}
 
     def still_current():
         try:
@@ -484,15 +576,30 @@ def popup(text, label):
         except (OSError, ValueError):
             return False
 
-    if not still_current():
-        return  # a newer copy took over this notification
-    if not resp.get("ok"):
-        notifier.notify("Translation failed", html.escape(resp.get("error", "unknown error"), quote=False), nid)
-        return
-    english = resp["text"]
-    body = english if len(english) <= 600 else english[:600].rstrip() + "…"
-    notifier.notify(title, html.escape(body, quote=False), nid,
-                    actions=[("copy", "Copy English"), ("open", "Open in Translate")])
+    if entries:
+        title, english, body, copy = "Dictionary", format_entries(entries), format_entries(entries, brief=True), "Copy definition"
+        nid = prev_id
+    else:
+        title, copy = f"{LANGS[label][1]} → English", "Copy English"
+        state = read_state()
+        waiting = "Translating…" if state and state.get("loaded") is True else "Loading the translation model…"
+        nid = notifier.notify(title, waiting, replaces=prev_id)
+        current.write_text(json.dumps({"token": token, "id": nid}))
+        try:
+            resp = request({"op": "translate", "text": text, "src": label})
+        except OSError as e:
+            resp = {"ok": False, "error": str(e)}
+        if not still_current():
+            return  # a newer copy took over this notification
+        if not resp.get("ok"):
+            notifier.notify("Translation failed", html.escape(resp.get("error", "unknown error"), quote=False), nid)
+            return
+        english = body = resp["text"]
+    body = body if len(body) <= 600 else body[:600].rstrip() + "…"
+    nid = notifier.notify(title, html.escape(body, quote=False), nid,
+                          actions=[("copy", copy), ("open", "Open in Translate")])
+    if entries:
+        current.write_text(json.dumps({"token": token, "id": nid}))
     picked = notifier.wait_action(nid)
     # A newer copy reuses this bubble; its clicks belong to that copy's process.
     if not still_current():
@@ -533,11 +640,16 @@ def on_copy():
     if "x-kde-passwordManagerHint" in types:
         return  # password managers mark secrets this way
     text = raw.decode("utf-8", "replace").strip()
-    if not is_installed(cfg):
-        return
-    label, conf = detect(text)
-    if not should_popup(text, label, conf, cfg["minConfidence"]):
-        return
+    # An English word or short phrase: definitions, no model needed.
+    entries = lookup(text) if cfg["dictionaryPopups"] and sum(c.isalpha() for c in text) >= 3 else None
+    if entries:
+        label = "auto"
+    else:
+        if not is_installed(cfg):
+            return
+        label, conf = detect(text)
+        if not should_popup(text, label, conf, cfg["minConfidence"]):
+            return
     # Same text copied again (or re-announced) shortly after: one popup is enough.
     seen = run_dir() / "last-copy"
     digest = hashlib.sha256(text.encode()).hexdigest()
@@ -555,7 +667,7 @@ def on_copy():
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
     try:
-        popup(text, label)
+        popup(text, label, entries)
     finally:
         os._exit(0)
 
@@ -646,6 +758,12 @@ def setup(key):
             download(f"https://huggingface.co/{repo}/resolve/{rev}/{name}", DATA_DIR / "models" / key / name,
                      sha256=lfs["oid"] if lfs else None, sha1_git=None if lfs else entry["oid"])
         save_config(model=key)
+    if not DICT_FILE.is_file():
+        gz = DICT_FILE.with_name("english-wordnet-2025.xml.gz")
+        download(DICT_URL, gz, sha256=DICT_SHA256)
+        print("Building the English dictionary…", flush=True)
+        build_dictionary(gz, DICT_FILE)
+        gz.unlink()
     print("Offline Translate is ready.")
 
 
@@ -654,7 +772,7 @@ def setup(key):
 def main(argv):
     cmd = argv[0] if argv else ""
     # Everything but setup and langs needs the venv's packages.
-    if cmd not in ("setup", "langs", "popups", "status", "copy", "take-open", "first-run-hint") and VENV_PY.is_file() and Path(sys.prefix) != VENV_PY.parent.parent:
+    if cmd not in ("setup", "langs", "popups", "dictionary", "status", "copy", "take-open", "first-run-hint") and VENV_PY.is_file() and Path(sys.prefix) != VENV_PY.parent.parent:
         os.execv(str(VENV_PY), [str(VENV_PY), str(Path(__file__).resolve()), *argv])
     if cmd == "setup":
         setup(argv[1] if len(argv) > 1 else "")
@@ -663,7 +781,12 @@ def main(argv):
     elif cmd == "run":
         try:
             req = json.loads(sys.stdin.readline())
-            resp = request({"op": "translate", "text": req.get("text"), "src": req.get("src") or ""})
+            text, src = req.get("text"), req.get("src") or ""
+            entries = lookup(text) if isinstance(text, str) and src in ("", "auto") else None
+            if entries:
+                resp = {"ok": True, "src": "en", "name": "English", "note": "Dictionary", "text": format_entries(entries)}
+            else:
+                resp = request({"op": "translate", "text": text, "src": src})
         except Exception as e:
             resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         print(json.dumps(resp), flush=True)
@@ -703,9 +826,10 @@ def main(argv):
     elif cmd == "langs":
         print(json.dumps(sorted(({"value": k, "label": v[1]} for k, v in LANGS.items() if k != "en"),
                                 key=lambda o: o["label"])))
-    elif cmd == "popups" and len(argv) > 1 and argv[1] in ("on", "off", "toggle"):
-        on = (not load_config()["clipboardPopups"]) if argv[1] == "toggle" else argv[1] == "on"
-        save_config(clipboardPopups=on)
+    elif cmd in ("popups", "dictionary") and len(argv) > 1 and argv[1] in ("on", "off", "toggle"):
+        key = "clipboardPopups" if cmd == "popups" else "dictionaryPopups"
+        on = (not load_config()[key]) if argv[1] == "toggle" else argv[1] == "on"
+        save_config(**{key: on})
         print("on" if on else "off")
     else:
         print(__doc__.strip())
