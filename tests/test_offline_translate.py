@@ -427,6 +427,7 @@ class OnCopy(Isolated):
         data = Path(self.tmp.name) / "data"
         build_fixture_dictionary(data)
         self.env["XDG_DATA_HOME"] = str(data)
+        self.config({"idleSeconds": 5, "dictionaryPopups": True})
 
     def test_english_word_shows_definitions_and_copy_works(self):
         self.use_fixture_dictionary()
@@ -445,10 +446,13 @@ class OnCopy(Isolated):
         self.wait_for(self.summoned)
         self.assertEqual(json.loads(self.helper("take-open").stdout), {"text": "give up", "src": "auto"})
 
-    def test_dictionary_off_falls_back_to_ignoring_english(self):
+    def test_dictionary_popups_are_off_by_default_and_toggle_on(self):
         self.use_fixture_dictionary()
-        self.assertEqual(self.helper("dictionary", "off").stdout.strip(), "off")
+        self.config({"idleSeconds": 5})
         self.assertFalse(self.on_copy("mice"))
+        self.assertEqual(self.helper("dictionary", "on").stdout.strip(), "on")
+        self.assertTrue(self.on_copy("mice"))
+        self.assertEqual(self.helper("dictionary", "toggle").stdout.strip(), "off")
 
     def test_overlay_looks_up_words_without_the_server(self):
         self.use_fixture_dictionary()

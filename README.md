@@ -13,14 +13,15 @@ Quickshell plugin for **Omarchy 4**.
 
 - **Copy popup:** copy non-English text anywhere and a notification shows the
   English translation, with **Copy English** and **Open in Translate**.
-- **Dictionary popup:** copy an English word or short phrase (up to three
-  words, like `serendipity`, `mice`, `give up`) and a notification shows its
-  definitions with **Copy definition** and **Open in Translate**. Inflected
-  forms find their base word (`studies` → `study`, `ran` → `run`).
+- **Dictionary popup (off by default):** after
+  `bin/offline-translate dictionary on`, copying an English word or short
+  phrase (up to three words, like `serendipity`, `mice`, `give up`) shows its
+  definitions with **Copy definition** and **Open in Translate**.
 - **Translator overlay:** paste text and it detects the language and
   translates as you paste. You can override the detected language. An English
   word or short phrase shows its full entry: pronunciation, every sense,
-  examples and synonyms.
+  examples and synonyms. Inflected forms find their base word (`studies` →
+  `study`, `ran` → `run`).
 - **Model only in RAM while in use:** the model loads on the first
   translation and unloads after 2 minutes idle. In between, nothing runs
   except a tiny `wl-paste` watcher. Each copy costs about 70 ms of language
@@ -81,7 +82,7 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
 - **Overlay:** `Ctrl+V` to paste, `Ctrl+Enter` copies the English and closes,
   `Esc` closes. Use the language picker when detection guesses wrong (short
   text, names, mixed languages).
-- **Popups** skip English text (except dictionary words), very short Latin-script snippets, URLs and paths,
+- **Popups** skip English text (unless dictionary popups are on and it's a word), very short Latin-script snippets, URLs and paths,
   clipboard over 20,000 characters, and anything a password manager marks as
   secret (`x-kde-passwordManagerHint`).
 
@@ -96,13 +97,13 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
   "idleSeconds": 120,
   "clipboardPopups": true,
   "minConfidence": 0.5,
-  "dictionaryPopups": true
+  "dictionaryPopups": false
 }
 ```
 
-- `dictionaryPopups: false` (or `bin/offline-translate dictionary off`) stops
-  popups for copied English words; translation popups and the overlay's
-  dictionary keep working.
+- `dictionaryPopups` is off by default. Turn on popups for copied English
+  words with `bin/offline-translate dictionary on` (`off` / `toggle` too).
+  The overlay's dictionary works either way.
 
 - `modelDir` points at an existing CTranslate2 NLLB model directory instead
   of the downloaded one. It must contain `model.bin`, `config.json`,

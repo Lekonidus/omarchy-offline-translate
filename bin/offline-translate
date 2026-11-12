@@ -48,7 +48,7 @@ MODELS = {
 }
 MODEL_FILES = ["config.json", "model.bin", "shared_vocabulary.json", "tokenizer.json"]
 DEFAULTS = {"model": "1.3B", "modelDir": "", "idleSeconds": 120, "clipboardPopups": True, "minConfidence": 0.5,
-            "dictionaryPopups": True}
+            "dictionaryPopups": False}
 DICT_FILE = DATA_DIR / "models" / "oewn-2025.sqlite"
 DICT_URL = "https://github.com/globalwordnet/english-wordnet/releases/download/2025-edition/english-wordnet-2025.xml.gz"
 DICT_SHA256 = "9ca6d1dcb75f822fdd66617f7d9da48142ace38dd544d6ad5e2feca1674ad3fe"
