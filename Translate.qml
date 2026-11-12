@@ -27,6 +27,7 @@ Item {
   property bool busy: false
   property bool dirty: false       // input changed while a request was in flight
   property var server: null        // state.json while the model server runs
+  property bool dictPopups: false  // config dictionaryPopups: popups for copied English words
   property var languages: [{ value: "auto", label: "Detect language" }]
 
   property color background: Commons.Color.menu.background
@@ -42,7 +43,7 @@ Item {
   readonly property string statusText: {
     if (!root.installed) return ""
     if (root.busy) return root.server && root.server.loaded === true ? "Translating…" : "Loading the translation model…"
-    if (!root.result) return input.text.trim() ? "" : "Paste text in any language — it translates to English as you paste. An English word or short phrase shows its definitions."
+    if (!root.result) return input.text.trim() ? "" : "Paste text in any language to translate it, or an English word for its definitions."
     if (!root.result.ok) return root.result.error || "Translation failed"
     var name = root.result.name || root.result.src
     if (root.result.note) return name + " · " + root.result.note
@@ -152,9 +153,27 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { root.installed = JSON.parse(text).installed === true } catch (e) {}
+        try {
+          var status = JSON.parse(text)
+          root.installed = status.installed === true
+          root.dictPopups = status.config.dictionaryPopups === true
+        } catch (e) {}
       }
     }
+  }
+
+  Process {
+    id: dictProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.dictPopups = text.trim() === "on"
+    }
+  }
+
+  function setDictPopups(on) {
+    root.dictPopups = on  // optimistic; the helper's answer confirms
+    dictProc.command = [root.helper, "dictionary", on ? "on" : "off"]
+    dictProc.running = true
   }
 
   Process {
@@ -286,6 +305,33 @@ Item {
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
+          }
+
+          Row {
+            anchors.right: sourcePicker.left
+            anchors.rightMargin: root.contentSpacing
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.sm
+            visible: root.installed
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Dictionary popups"
+              color: root.foreground
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+
+              MouseArea { anchors.fill: parent; onClicked: root.setDictPopups(!root.dictPopups) }
+            }
+
+            ToggleSwitch {
+              anchors.verticalCenter: parent.verticalCenter
+              checked: root.dictPopups
+              busy: dictProc.running
+              foreground: root.foreground
+              onToggled: root.setDictPopups(!root.dictPopups)
+            }
           }
 
           SearchableDropdown {

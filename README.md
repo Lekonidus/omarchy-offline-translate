@@ -13,8 +13,9 @@ Quickshell plugin for **Omarchy 4**.
 
 - **Copy popup:** copy non-English text anywhere and a notification shows the
   English translation, with **Copy English** and **Open in Translate**.
-- **Dictionary popup (off by default):** after
-  `bin/offline-translate dictionary on`, copying an English word or short
+- **Dictionary popup (off by default):** with the **Dictionary popups**
+  switch at the top of the translator on (or `bin/offline-translate
+  dictionary on`), copying an English word or short
   phrase (up to three words, like `serendipity`, `mice`, `give up`) shows its
   definitions with **Copy definition** and **Open in Translate**.
 - **Translator overlay:** paste text and it detects the language and
@@ -102,7 +103,7 @@ bindd = SUPER CTRL, T, Translate, exec, omarchy-shell shell toggle io.github.lek
 ```
 
 - `dictionaryPopups` is off by default. Turn on popups for copied English
-  words with `bin/offline-translate dictionary on` (`off` / `toggle` too).
+  words with the switch in the translator or `bin/offline-translate dictionary on`.
   The overlay's dictionary works either way.
 
 - `modelDir` points at an existing CTranslate2 NLLB model directory instead
