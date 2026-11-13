@@ -149,6 +149,12 @@ class Dictionary(unittest.TestCase):
         self.assertIn("Synonyms: analyze", full)
         self.assertEqual(ot.format_entries(ot.lookup("mice"), brief=True), "mouse (noun)  /maʊs/\n  1. a small rodent <b>")
 
+    def test_upstream_notice_is_kept_in_the_database(self):
+        import sqlite3
+        source, text = sqlite3.connect(ot.DICT_FILE).execute("SELECT source, text FROM notice").fetchone()
+        self.assertEqual(source, ot.DICT_URL)
+        self.assertIn("THIS SOFTWARE AND DATABASE IS PROVIDED", text)
+
     def test_missing_dictionary_is_no_entry(self):
         ot.DICT_FILE = Path(self.tmp.name) / "missing.sqlite"
         self.assertIsNone(ot.lookup("mouse"))
@@ -460,6 +466,86 @@ class OnCopy(Isolated):
         self.assertEqual((resp["note"], resp["text"].splitlines()[0]), ("Dictionary", "study (verb)"))
         self.assertFalse((self.rd / "sock").exists(), "no model server for a lookup")
         self.assertEqual(self.run_translate("study", src="fr")["text"], "[fra_Latn] study", "a forced language translates")
+
+    def test_new_copy_ends_the_previous_popup(self):
+        self.on_copy("שלום, מה שלומך היום?")  # no action: this popup keeps waiting
+        self.notifications(2)
+        first = int((self.rd / "popup.pid").read_text().split()[0])
+        self.assertTrue(Path(f"/proc/{first}").exists())
+        self.on_copy("Привет, как у тебя дела сегодня?")
+        self.notifications(4)
+        second = int((self.rd / "popup.pid").read_text().split()[0])
+        time.sleep(0.5)
+        self.assertNotEqual(first, second)
+        self.assertFalse(Path(f"/proc/{first}").exists() and "Z" not in Path(f"/proc/{first}/stat").read_text().split()[2],
+                         "the older popup process must be gone")
+        self.assertTrue(Path(f"/proc/{second}").exists())
+
+    def test_stale_popup_pid_is_not_killed(self):
+        sleeper = subprocess.Popen(["sleep", "30"])
+        try:
+            self.rd.mkdir(mode=0o700, exist_ok=True)
+            ot.private_file(self.rd / "popup.pid", f"{sleeper.pid} 1")  # pid alive, start time wrong
+            self.on_copy("שלום, מה שלומך היום?")
+            self.notifications(2)
+            self.assertIsNone(sleeper.poll(), "a reused pid must survive")
+        finally:
+            sleeper.kill()
+
+
+class Download(unittest.TestCase):
+    """setup's downloads: exact size, digest and an overall deadline; failures leave nothing behind."""
+
+    def setUp(self):
+        import hashlib
+        import http.server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.body = os.urandom(300_000)
+        self.sha = hashlib.sha256(self.body).hexdigest()
+        body = self.body
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(body * (3 if self.path == "/big" else 1))
+                except OSError:
+                    pass  # the client hung up on an oversized body, as it should
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}"
+        self.dest = Path(self.tmp.name) / "file.bin"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.tmp.cleanup()
+
+    def test_exact_file_downloads(self):
+        ot.download(self.url + "/ok", self.dest, len(self.body), sha256=self.sha)
+        self.assertEqual(self.dest.read_bytes(), self.body)
+
+    def test_oversized_response_is_cut_off_and_removed(self):
+        with self.assertRaises(SystemExit) as e:
+            ot.download(self.url + "/big", self.dest, len(self.body), sha256=self.sha)
+        self.assertIn("more than the expected", str(e.exception))
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+
+    def test_overall_deadline(self):
+        real, calls = ot.time.monotonic, []
+        # The first call sets the deadline; every later one is hours past it.
+        ot.time.monotonic = lambda: real() + (10_000 if calls.append(1) or len(calls) > 1 else 0)
+        try:
+            with self.assertRaises(SystemExit) as e:
+                ot.download(self.url + "/ok", self.dest, len(self.body), sha256=self.sha)
+        finally:
+            ot.time.monotonic = real
+        self.assertIn("took too long", str(e.exception))
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
 
 
 class FirstRunHint(Isolated):

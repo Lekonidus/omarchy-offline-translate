@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.lekonidus.offline-translate",
   "name": "Offline Translate",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Lekonidus",
   "license": "MIT",
   "description": "Translate ~115 languages to English, fully offline (NLLB-200); copying non-English text shows a translation popup, paste an English word for its definitions (offline English dictionary, Open English WordNet). INSTALL: run `omarchy plugin add https://github.com/Lekonidus/omarchy-offline-translate.git --enable`, then click the translate icon in the bar and choose \"Run setup\" (one-time 1.4 GB download).",

@@ -25,6 +25,7 @@ import html
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -42,6 +43,7 @@ VENV_PY = DATA_DIR / "venv" / "bin" / "python"
 LID_FILE = DATA_DIR / "models" / "lid.176.ftz"
 LID_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
 LID_SHA256 = "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83"
+LID_SIZE = 938013
 MODELS = {
     "1.3B": ("OpenNMT/nllb-200-distilled-1.3B-ct2-int8", "70f572adafa4794890ce7826156a4209717855af"),
     "3.3B": ("OpenNMT/nllb-200-3.3B-ct2-int8", "28d998cc8548ad62f4f98cf8860928c3af99b97b"),
@@ -52,6 +54,8 @@ DEFAULTS = {"model": "1.3B", "modelDir": "", "idleSeconds": 120, "clipboardPopup
 DICT_FILE = DATA_DIR / "models" / "oewn-2025.sqlite"
 DICT_URL = "https://github.com/globalwordnet/english-wordnet/releases/download/2025-edition/english-wordnet-2025.xml.gz"
 DICT_SHA256 = "9ca6d1dcb75f822fdd66617f7d9da48142ace38dd544d6ad5e2feca1674ad3fe"
+DICT_SIZE = 11363503
+DICT_NOTICE = PLUGIN_DIR / "licenses" / "OEWN-WNDB_License.txt"  # must travel with every copy of the data
 MAX_CLIPBOARD = 20_000
 MAX_TEXT = 100_000
 TARGET = "eng_Latn"
@@ -255,6 +259,8 @@ def build_dictionary(xml_gz, dest):
     db = sqlite3.connect(part)
     db.execute("CREATE TABLE words (key TEXT PRIMARY KEY, data TEXT NOT NULL) WITHOUT ROWID")
     db.execute("CREATE TABLE forms (form TEXT NOT NULL, lemma TEXT NOT NULL)")
+    db.execute("CREATE TABLE notice (source TEXT NOT NULL, text TEXT NOT NULL)")
+    db.execute("INSERT INTO notice VALUES (?, ?)", (DICT_URL, DICT_NOTICE.read_text()))
     rows = []
     for key, items in entries.items():
         merged = {}  # (word, pos) -> entry; satellite adjectives join their adjective
@@ -402,7 +408,6 @@ def recv_line(conn, limit=4 * MAX_TEXT + 1024):
 
 def serve():
     import fcntl
-    import signal
     rd = run_dir()
     lock = open(rd / "server.lock", "w")
     # Clients that all found no server each spawn one. The lock holder may be
@@ -611,14 +616,32 @@ def popup(text, label, entries=None):
         subprocess.run(["omarchy-shell", "shell", "summon", PLUGIN_ID, '{"stashed": true}'])
 
 
+def start_ticks(pid):
+    """A process's start time in clock ticks since boot: with the pid, its identity."""
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
 def parent_age():
     """Seconds since our parent (wl-paste --watch) started."""
     try:
-        start_ticks = int(Path(f"/proc/{os.getppid()}/stat").read_text().rsplit(")", 1)[1].split()[19])
         uptime = float(Path("/proc/uptime").read_text().split()[0])
-        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+        return uptime - start_ticks(os.getppid()) / os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError):
         return 1e9
+
+
+def stop_previous_popup(rd):
+    """At most one popup process lives: a new copy ends the one before it.
+
+    wl-paste runs on-copy handlers one at a time and each records its popup's
+    pid before returning, so this always sees the latest one.
+    """
+    try:
+        pid, ticks = map(int, (rd / "popup.pid").read_text().split())
+        if start_ticks(pid) == ticks:  # not a reused pid
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError, IndexError):
+        pass
 
 
 def on_copy():
@@ -659,8 +682,14 @@ def on_copy():
     except OSError:
         pass
     seen.write_text(digest)
+    rd = run_dir()
+    stop_previous_popup(rd)
     # Detach so wl-paste gets its next event while we translate and wait on the popup.
-    if os.fork():
+    if pid := os.fork():
+        try:
+            private_file(rd / "popup.pid", f"{pid} {start_ticks(pid)}")
+        except (OSError, ValueError, IndexError):
+            pass  # already gone
         return
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -697,23 +726,34 @@ def launch_setup():
                      stderr=subprocess.DEVNULL)
 
 
-def download(url, dest, sha256=None, sha1_git=None):
+def download(url, dest, size, sha256=None, sha1_git=None):
+    """Fetch exactly `size` bytes with a matching digest, within an overall deadline."""
     import urllib.request
     if dest.is_file() and verify(dest, sha256, sha1_git):
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     print(f"Downloading {dest.name}…", flush=True)
-    with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        got, last = 0, -1
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-            got += len(chunk)
-            pct = got * 100 // total if total else -1
-            if pct != last and pct % 5 == 0:
-                print(f"  {pct}% of {total / 1e9:.2f} GB", flush=True)
-                last = pct
+    # The socket timeout only bounds each read; this bounds the whole download
+    # (an average of at least 100 kB/s, plus ten minutes).
+    deadline = time.monotonic() + 600 + size / 100_000
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
+            got, last = 0, -1
+            while chunk := r.read(min(1 << 20, size + 1 - got)):
+                got += len(chunk)
+                if got > size:
+                    raise ValueError(f"more than the expected {size} bytes")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("took too long")
+                f.write(chunk)
+                pct = got * 100 // size
+                if pct != last and pct % 5 == 0:
+                    print(f"  {pct}% of {size / 1e9:.2f} GB", flush=True)
+                    last = pct
+    except (OSError, ValueError) as e:
+        part.unlink(missing_ok=True)
+        sys.exit(f"Download of {dest.name} failed: {e}")
     if not verify(part, sha256, sha1_git):
         part.unlink()
         sys.exit(f"Checksum mismatch for {dest.name}; download removed")
@@ -743,27 +783,40 @@ def setup(key):
         # ctranslate2 ships wheels for the distro Python before newer ones.
         base = "/usr/bin/python3" if Path("/usr/bin/python3").is_file() else sys.executable
         subprocess.check_call([base, "-m", "venv", str(VENV_PY.parent.parent)])
-    subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--disable-pip-version-check", "-q",
+    # Exactly the hash-locked files in the two requirements lists, nothing resolved or
+    # fetched unpinned. All are PyPI wheels except fasttext-predict, which has no wheel
+    # for current Pythons and is built from its pinned sdist with the pinned build tools.
+    # (tokenizers' huggingface-hub dependency only downloads tokenizers; not installed.)
+    pip = [str(VENV_PY), "-m", "pip", "install", "--disable-pip-version-check", "-q", "--no-deps", "--require-hashes"]
+    subprocess.check_call([*pip, "--only-binary", ":all:", "-r", str(PLUGIN_DIR / "build-requirements.txt")])
+    subprocess.check_call([*pip, "--no-build-isolation", "--only-binary", ":all:", "--no-binary", "fasttext-predict",
                            "-r", str(PLUGIN_DIR / "requirements.txt")])
-    download(LID_URL, LID_FILE, sha256=LID_SHA256)
+    download(LID_URL, LID_FILE, LID_SIZE, sha256=LID_SHA256)
     if cfg["modelDir"]:
         print(f"Using modelDir {cfg['modelDir']} from config; skipping model download")
     else:
         repo, rev = MODELS[key]
         with urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/{rev}", timeout=60) as r:
-            tree = {e["path"]: e for e in json.load(r)}
+            tree = {e["path"]: e for e in json.loads(r.read(1 << 20))}  # a few hundred bytes in practice
         for name in MODEL_FILES:
             entry = tree[name]
             lfs = entry.get("lfs")
             download(f"https://huggingface.co/{repo}/resolve/{rev}/{name}", DATA_DIR / "models" / key / name,
-                     sha256=lfs["oid"] if lfs else None, sha1_git=None if lfs else entry["oid"])
+                     int(entry["size"]), sha256=lfs["oid"] if lfs else None, sha1_git=None if lfs else entry["oid"])
         save_config(model=key)
+    if DICT_FILE.is_file():  # built before 1.1.1 without the WordNet notice inside: rebuild
+        db = sqlite3.connect(DICT_FILE)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name = 'notice'").fetchone():
+            DICT_FILE.unlink()
+        db.close()
     if not DICT_FILE.is_file():
         gz = DICT_FILE.with_name("english-wordnet-2025.xml.gz")
-        download(DICT_URL, gz, sha256=DICT_SHA256)
+        download(DICT_URL, gz, DICT_SIZE, sha256=DICT_SHA256)
         print("Building the English dictionary…", flush=True)
         build_dictionary(gz, DICT_FILE)
         gz.unlink()
+    # The WordNet notice stays with the data (it is also inside the database).
+    DICT_FILE.with_name("oewn-2025.LICENSE.txt").write_text(DICT_NOTICE.read_text())
     print("Offline Translate is ready.")
 
 

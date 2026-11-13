@@ -50,7 +50,13 @@ Until setup has run, the bar icon is dimmed and its tooltip says
 **Setup needed**.
 
 Setup creates a Python venv in `~/.local/share/omarchy-offline-translate/`
-(pinned `ctranslate2`, `tokenizers`, `fasttext-predict`, `numpy`, `jeepney`) and
+and installs exactly the hash-locked files in `requirements.txt` (`ctranslate2`,
+`tokenizers`, `fasttext-predict`, `numpy`, `PyYAML`, `jeepney`) with
+`pip --no-deps --require-hashes`, so nothing is resolved or fetched unpinned.
+All are PyPI wheels except `fasttext-predict`, which has no wheel for current
+Python versions: it is compiled from its hash-pinned source archive, using the
+hash-locked build tools in `build-requirements.txt` (this needs a C++
+compiler, which Omarchy has). Setup then
 downloads, checksum-verified:
 
 | File | Size | RAM while loaded |
@@ -120,7 +126,9 @@ omarchy plugin update io.github.lekonidus.offline-translate
 ```
 
 Re-running `setup` installs any new pinned packages (1.0.1 added `jeepney`)
-and builds anything new (1.1.0 added the dictionary).
+and builds anything new (1.1.0 added the dictionary). Every download has a
+fixed expected size and checksum and an overall time limit; one that runs
+over is stopped and deleted.
 Models already downloaded are verified, not fetched again. Then run
 `omarchy restart shell`: the shell's hot reload can keep the old QML running.
 
@@ -151,6 +159,7 @@ local users can read through `/proc/<pid>/cmdline`:
 
 - Omarchy 4 (`schemaVersion: 1` plugin API), `wl-clipboard`, `notify-send`
 - Python 3.10+ with `venv` (the distro Python is preferred for wheel availability)
+  and a C++ compiler for `fasttext-predict`
 - About 1.5 GB disk for the default model
 
 ## Tests
@@ -170,4 +179,8 @@ are **not** covered by this license:
 - fastText `lid.176` (Meta):
   [CC-BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/).
 - Open English WordNet 2025 (Global WordNet Association, based on Princeton
-  WordNet): [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+  WordNet): [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Its
+  copyright notice and disclaimer are in
+  [`licenses/OEWN-WNDB_License.txt`](licenses/OEWN-WNDB_License.txt), and setup
+  keeps them with the built dictionary: inside the SQLite file (`notice` table)
+  and next to it as `oewn-2025.LICENSE.txt`.
